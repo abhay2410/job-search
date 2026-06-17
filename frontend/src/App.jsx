@@ -58,7 +58,10 @@ function App() {
       <header className="header">
         <div className="brand">
           <div className="logo-icon" />
-          <h1 className="logo-text">ApplyPilot &times; AIHawk</h1>
+          <div style={{ display: 'flex', flexDirection: 'column' }}>
+            <h1 className="logo-text">Job Search</h1>
+            <span style={{ fontSize: '0.7rem', color: 'var(--text-muted)', marginTop: '-4px' }}>Developed by Abhay</span>
+          </div>
         </div>
         
         {/* Navigation Tabs */}
