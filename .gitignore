@@ -1,0 +1,11 @@
+node_modules/
+.env
+config.json
+database.json
+user_data/
+temp/
+scratch/
+tmp_hashes.txt
+file_hashes.txt
+hash_tmp.txt
+.DS_Store
