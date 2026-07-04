@@ -163,7 +163,47 @@ async function lookupHunterIo(domain, logFn) {
   }
 }
 
-async function findHrDetails(companyName, logFn = console.log) {
+// Strategy 0 Helper: Scrape LinkedIn profile for email via Apify
+async function findRecruiterEmailApify(posterUrl, config, logFn) {
+  const apiToken = config.apifyApiToken || process.env.APIFY_API_TOKEN;
+  if (!apiToken || !posterUrl) return null;
+  
+  logFn(`[Apify Recruiter] Fetching email for LinkedIn profile: ${posterUrl}...`, 'info');
+  try {
+    const { ApifyClient } = require('apify-client');
+    const client = new ApifyClient({ token: apiToken });
+    
+    // Support targetUrls and profileUrls format
+    const runInput = {
+      profileUrls: [posterUrl],
+      targetUrls: [posterUrl]
+    };
+    
+    const run = await client.actor('LpVuK3Zozwuipa5bp').call(runInput);
+    const { items } = await client.dataset(run.defaultDatasetId).listItems();
+    
+    if (items && items.length > 0) {
+      const profile = items[0];
+      const email = profile.email || profile.contact?.email || profile.personalInfo?.email || '';
+      const fullName = profile.fullName || profile.name || [profile.firstName, profile.lastName].filter(Boolean).join(' ') || '';
+      const position = profile.title || profile.headline || '';
+      
+      if (email) {
+        logFn(`[Apify Recruiter] ✅ Successfully found email for recruiter ${fullName}: ${email}`, 'success');
+        return { email, name: fullName, position };
+      } else {
+        logFn(`[Apify Recruiter] Scrape succeeded, but no email address found in the profile of ${fullName || posterUrl}`, 'warning');
+      }
+    } else {
+      logFn(`[Apify Recruiter] Actor run completed but returned no dataset items.`, 'warning');
+    }
+  } catch (err) {
+    logFn(`[Apify Recruiter] Actor run failed: ${err.message}`, 'warning');
+  }
+  return null;
+}
+
+async function findHrDetails(companyName, logFn = console.log, config = null, posterUrl = '') {
   logFn(`[HR] Looking up career page & HR email for "${companyName}"...`, 'info');
 
   const result = await withTimeout((async () => {
@@ -172,19 +212,43 @@ async function findHrDetails(companyName, logFn = console.log) {
     let hrName = '';
     let hrPosition = '';
 
+    // Load config from disk if not provided
+    let activeConfig = config;
+    if (!activeConfig) {
+      try {
+        const fs = require('fs');
+        const configPath = path.join(__dirname, '..', 'config.json');
+        if (fs.existsSync(configPath)) {
+          activeConfig = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+        }
+      } catch (e) {}
+    }
+
+    // Strategy 0: If recruiter profile URL is available and Apify is enabled, query recruiter details
+    if (posterUrl && activeConfig && activeConfig.apifyEnabled) {
+      const recruiter = await findRecruiterEmailApify(posterUrl, activeConfig, logFn);
+      if (recruiter && recruiter.email) {
+        hrEmail = recruiter.email;
+        hrName = recruiter.name || '';
+        hrPosition = recruiter.position || '';
+      }
+    }
+
     // Strategy 1: Try direct career page URLs (fastest, most reliable)
-    const direct = await withTimeout(
-      scrapeCareerPageDirectly(companyName, logFn),
-      12000,
-      null
-    );
-    if (direct && direct.careerSiteUrl) {
-      careerSiteUrl = direct.careerSiteUrl;
-      hrEmail = direct.hrEmail || '';
+    if (!hrEmail) {
+      const direct = await withTimeout(
+        scrapeCareerPageDirectly(companyName, logFn),
+        12000,
+        null
+      );
+      if (direct && direct.careerSiteUrl) {
+        careerSiteUrl = direct.careerSiteUrl;
+        hrEmail = direct.hrEmail || '';
+      }
     }
 
     // Strategy 2: Bing search if direct failed
-    if (!careerSiteUrl) {
+    if (!careerSiteUrl && !hrEmail) {
       try {
         const careerResults = await withTimeout(
           searchBing(`${companyName} official careers jobs apply`, logFn),

@@ -1,10 +1,12 @@
 import React, { useState, useEffect } from 'react';
 
 export default function QueueManager({ jobs, refreshJobs }) {
-  const [activeTab, setActiveTab] = useState('scored'); // 'scored', 'review', 'ready'
+  const [activeTab, setActiveTab] = useState('scored'); // 'scored', 'review', 'ready', 'exported'
   const [selectedJob, setSelectedJob] = useState(null);
   const [analyzingId, setAnalyzingId] = useState(null);
   const [applyingId, setApplyingId] = useState(null);
+  const [connectingId, setConnectingId] = useState(null);
+  const [markingAppliedId, setMarkingAppliedId] = useState(null);
 
   // Form edit states
   const [editResume, setEditResume] = useState('');
@@ -33,6 +35,7 @@ export default function QueueManager({ jobs, refreshJobs }) {
     if (activeTab === 'scored') return j.status === 'scored';
     if (activeTab === 'review') return j.status === 'review';
     if (activeTab === 'ready') return j.status === 'ready';
+    if (activeTab === 'exported') return j.status === 'exported';
     return false;
   });
 
@@ -110,6 +113,47 @@ export default function QueueManager({ jobs, refreshJobs }) {
       .catch(err => {
         console.error(err);
         setApplyingId(null);
+      });
+  };
+
+  const triggerMarkApplied = (jobId) => {
+    setMarkingAppliedId(jobId);
+    fetch('/api/jobs/mark-applied', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: jobId })
+    })
+      .then(res => res.json())
+      .then(() => {
+        setMarkingAppliedId(null);
+        refreshJobs();
+      })
+      .catch(err => {
+        console.error(err);
+        setMarkingAppliedId(null);
+      });
+  };
+
+  const triggerLinkedInConnect = (jobId) => {
+    setConnectingId(jobId);
+    fetch('/api/jobs/linkedin-connect', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: jobId })
+    })
+      .then(res => res.json())
+      .then(data => {
+        setConnectingId(null);
+        if (data.success) {
+          alert(data.message);
+          refreshJobs();
+        } else {
+          alert(data.error || data.message || 'Failed to connect.');
+        }
+      })
+      .catch(err => {
+        setConnectingId(null);
+        alert(`Error: ${err.message}`);
       });
   };
 
@@ -314,6 +358,12 @@ export default function QueueManager({ jobs, refreshJobs }) {
           >
             Ready to Apply ({jobs.filter(j => j.status === 'ready').length})
           </button>
+          <button 
+            className={`tab-btn ${activeTab === 'exported' ? 'active' : ''}`}
+            onClick={() => setActiveTab('exported')}
+          >
+            Exported Assets ({jobs.filter(j => j.status === 'exported').length})
+          </button>
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
           {(purgeMsg || alertsStatus) && (
@@ -444,11 +494,26 @@ export default function QueueManager({ jobs, refreshJobs }) {
                 </div>
               )}
 
+              {/* Generated Asset Directory Details */}
+              {selectedJob.status === 'exported' && selectedJob.folderPath && (
+                <div className="alert alert-success" style={{ margin: 0, border: '1px solid var(--color-success)', background: 'rgba(16, 185, 129, 0.05)', display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontWeight: 'bold' }}>
+                    <span>📁</span> Assets Exported to Local Folder:
+                  </div>
+                  <code style={{ background: 'rgba(0,0,0,0.3)', padding: '0.5rem', borderRadius: '4px', wordBreak: 'break-all', fontFamily: 'monospace', fontSize: '0.85rem', color: '#fff' }}>
+                    {selectedJob.folderPath}
+                  </code>
+                  <div style={{ fontSize: '0.8rem', color: 'var(--text-muted)', lineHeight: '1.4' }}>
+                    Open this path on your computer. It contains your tailored <strong>PDF resume</strong>, cover letter text, and cold email outreach note.
+                  </div>
+                </div>
+              )}
+
               {/* Scored Stage Actions */}
               {selectedJob.status === 'scored' && (
                 <div style={{ padding: '2rem 1rem', textAlign: 'center', border: '1px dashed var(--border-color)', borderRadius: '8px' }}>
                   <p style={{ marginBottom: '1.25rem', color: 'var(--text-muted)' }}>
-                    This job description has passed initial scoring. Ready to trigger AIHawk tailoring.
+                    This job description has passed initial scoring. Ready to trigger abhii resume & cover letter tailoring.
                   </p>
                   <button 
                     className="btn btn-primary" 
@@ -531,8 +596,14 @@ export default function QueueManager({ jobs, refreshJobs }) {
                 </div>
               )}
 
+              {selectedJob.connectionError && (
+                <div className="alert alert-danger" style={{ margin: 0 }}>
+                  <strong>LinkedIn Connect Error:</strong> {selectedJob.connectionError}
+                </div>
+              )}
+
               {/* Tailored Resumes, Cover Letter & Cold Email Section */}
-              {(selectedJob.status === 'ready' || selectedJob.status === 'review') && selectedJob.tailoredResume && (
+              {(selectedJob.status === 'ready' || selectedJob.status === 'review' || selectedJob.status === 'exported') && selectedJob.tailoredResume && (
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
                   
                   {/* Confidence metrics */}
@@ -683,14 +754,43 @@ export default function QueueManager({ jobs, refreshJobs }) {
                     <button className="btn btn-secondary" onClick={handleSaveEdits} disabled={savingEdits}>
                       {savingEdits ? 'Saving Edits...' : 'Save Manual Changes'}
                     </button>
-                    <button 
-                      className="btn btn-primary" 
-                      onClick={() => triggerApply(selectedJob.id)}
-                      disabled={applyingId === selectedJob.id}
-                      style={{ flex: 1 }}
-                    >
-                      {applyingId === selectedJob.id ? 'Running Auto-Applier (Check logs)...' : 'Launch Auto-Applier & Submit'}
-                    </button>
+                    {selectedJob.poster && selectedJob.poster.url && (
+                      <button 
+                        className="btn btn-secondary" 
+                        onClick={() => triggerLinkedInConnect(selectedJob.id)}
+                        disabled={connectingId === selectedJob.id || selectedJob.connectionSent}
+                        style={{ border: '1px solid var(--color-primary)' }}
+                      >
+                        {connectingId === selectedJob.id 
+                          ? 'Connecting...' 
+                          : selectedJob.connectionSent 
+                            ? `Connect Sent (${selectedJob.connectionSent === 'connected' ? 'Invite' : 'DM'})` 
+                            : 'Send LinkedIn Connect'}
+                      </button>
+                    )}
+                    {/* Generate Assets button — for ready/review jobs */}
+                    {(selectedJob.status === 'ready' || selectedJob.status === 'review') && (
+                      <button 
+                        className="btn btn-primary" 
+                        onClick={() => triggerApply(selectedJob.id)}
+                        disabled={applyingId === selectedJob.id}
+                        style={{ flex: 1 }}
+                      >
+                        {applyingId === selectedJob.id ? '📦 Generating Assets...' : '📦 Generate Assets & Export'}
+                      </button>
+                    )}
+
+                    {/* Mark as Applied button — for exported jobs */}
+                    {selectedJob.status === 'exported' && (
+                      <button 
+                        className="btn btn-success" 
+                        onClick={() => triggerMarkApplied(selectedJob.id)}
+                        disabled={markingAppliedId === selectedJob.id}
+                        style={{ flex: 1 }}
+                      >
+                        {markingAppliedId === selectedJob.id ? '⏳ Marking...' : '✅ I Applied — Mark as Submitted'}
+                      </button>
+                    )}
                   </div>
 
                 </div>

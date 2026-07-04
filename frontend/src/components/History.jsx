@@ -25,6 +25,7 @@ export default function History({ jobs, refreshJobs }) {
   const getStatusBadgeClass = (status) => {
     switch (status) {
       case 'submitted': return 'badge badge-submitted';
+      case 'exported': return 'badge badge-ready';
       case 'ready': return 'badge badge-ready';
       case 'review': return 'badge badge-review';
       case 'scored': return 'badge badge-scored';

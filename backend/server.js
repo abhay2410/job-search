@@ -1,5 +1,6 @@
 const express = require('express');
 const cors = require('cors');
+const compression = require('compression');
 const fs = require('fs');
 const path = require('path');
 require('dotenv').config();
@@ -8,11 +9,11 @@ const notifier = require('./notifier');
 const app = express();
 const PORT = process.env.PORT || 5000;
 
+app.use(compression());
 app.use(cors());
 app.use(express.json());
 
 const CONFIG_PATH = path.join(__dirname, '..', 'config.json');
-const DATABASE_PATH = path.join(__dirname, '..', 'database.json');
 
 let logsBuffer = [];
 let activeClients = [];
@@ -83,33 +84,39 @@ async function writeConfig(config) {
   }
 }
 
+const sqliteDb = require('./db');
+
+let dbCache = null;
+
 async function readDatabaseInternal() {
+  const jobs = sqliteDb.getAllJobs();
+  let savedAnswers = {};
+  const answersPath = path.join(__dirname, '..', 'answers.json');
   try {
-    if (!fs.existsSync(DATABASE_PATH)) {
-      return { jobs: [] };
+    if (fs.existsSync(answersPath)) {
+      savedAnswers = JSON.parse(await fs.promises.readFile(answersPath, 'utf8'));
     }
-    const data = await fs.promises.readFile(DATABASE_PATH, 'utf8');
-    return JSON.parse(data);
-  } catch (err) {
-    console.error('Error reading database:', err);
-    return { jobs: [] };
-  }
+  } catch (err) {}
+  return { jobs, savedAnswers };
 }
 
 async function writeDatabaseInternal(db) {
-  try {
-    await fs.promises.writeFile(DATABASE_PATH, JSON.stringify(db, null, 2), 'utf8');
-    return true;
-  } catch (err) {
-    console.error('Error writing database:', err);
-    return false;
+  // We use this only for full syncs if needed, though mutateDatabase handles it better.
+  for (const job of db.jobs) {
+    sqliteDb.upsertJob(job);
   }
+  const answersPath = path.join(__dirname, '..', 'answers.json');
+  await fs.promises.writeFile(answersPath, JSON.stringify(db.savedAnswers || {}, null, 2), 'utf8');
+  return true;
 }
 
 async function readDatabase() {
+  if (dbCache) return dbCache;
   const release = await dbMutex.acquire();
   try {
-    return await readDatabaseInternal();
+    if (dbCache) return dbCache;
+    dbCache = await readDatabaseInternal();
+    return dbCache;
   } finally {
     release();
   }
@@ -118,19 +125,50 @@ async function readDatabase() {
 async function writeDatabase(db) {
   const release = await dbMutex.acquire();
   try {
-    return await writeDatabaseInternal(db);
+    const success = await writeDatabaseInternal(db);
+    if (success) dbCache = db;
+    return success;
   } finally {
     release();
   }
 }
 
-// Transaction wrapper for atomic read-mutate-write operations
+// Transaction wrapper for atomic read-mutate-write operations using SQLite
 async function mutateDatabase(mutationFn) {
   const release = await dbMutex.acquire();
   try {
     const db = await readDatabaseInternal();
+    
+    // Snapshot to detect changes
+    const originalJobs = new Map(db.jobs.map(j => [j.id, JSON.stringify(j)]));
+    const originalAnswers = JSON.stringify(db.savedAnswers);
+
     const result = await mutationFn(db);
-    await writeDatabaseInternal(db);
+
+    // Write only changed jobs to SQLite
+    const currentIds = new Set();
+    for (const job of db.jobs) {
+      currentIds.add(job.id);
+      const originalStr = originalJobs.get(job.id);
+      if (!originalStr || originalStr !== JSON.stringify(job)) {
+        sqliteDb.upsertJob(job);
+      }
+    }
+
+    // Handle deletions
+    for (const oldId of originalJobs.keys()) {
+      if (!currentIds.has(oldId)) {
+        sqliteDb.db.prepare('DELETE FROM jobs WHERE id = ?').run(oldId);
+      }
+    }
+
+    // Handle answers
+    if (JSON.stringify(db.savedAnswers) !== originalAnswers) {
+      const answersPath = path.join(__dirname, '..', 'answers.json');
+      await fs.promises.writeFile(answersPath, JSON.stringify(db.savedAnswers || {}, null, 2), 'utf8');
+    }
+
+    dbCache = db; // Sync cache
     return result;
   } finally {
     release();
@@ -493,13 +531,10 @@ app.post('/api/jobs/score', async (req, res) => {
             targetJob.score = result.score;
             targetJob.scoreReason = result.reason;
             
-            // Auto filter or flag
-            if (result.score >= 7) {
+            // Auto filter or flag (Score >= 6 passes to scored for analysis)
+            if (result.score >= 6) {
               targetJob.status = 'scored';
               systemLog(`Job passed scoring! Score: ${result.score}/10. Reason: ${result.reason}`, 'success');
-            } else if (result.score === 6) {
-              targetJob.status = 'review';
-              systemLog(`Job scored borderline (6/10). Added to Human Review Queue. Reason: ${result.reason}`, 'warning');
             } else {
               targetJob.status = 'skipped';
               systemLog(`Job filtered out. Score: ${result.score}/10. Reason: ${result.reason}`, 'info');
@@ -563,14 +598,8 @@ app.post('/api/jobs/analyze', async (req, res) => {
     systemLog(`Calculating application confidence score...`, 'info');
     const confidence = await llm.calculateConfidence(job, analysis, tailoredResume, coverLetter, config);
 
-    let status = 'review';
-    // Transition status to ready if no review flagged, else review
-    if (confidence >= 80 && !analysis.dealBreaker) {
-      status = 'ready';
-      systemLog(`Job analysis ready! Confidence score: ${confidence}%. Ready to apply.`, 'success');
-    } else {
-      systemLog(`Job analysis complete but flagged for human review (Confidence: ${confidence}%, Dealbreaker: ${analysis.dealBreaker || 'None'}).`, 'warning');
-    }
+    const status = 'ready';
+    systemLog(`Job analysis ready! Confidence score: ${confidence}%. Ready to apply.`, 'success');
 
     // Send to Alerts automatically
     let alertSentResult = null;
@@ -610,64 +639,89 @@ app.post('/api/jobs/analyze', async (req, res) => {
 });
 
 // STAGE 6 - Application Submission (Playwright applier)
-// STAGE 6 - Application Submission (Playwright applier)
 app.post('/api/jobs/apply', async (req, res) => {
-  const { id, force = false } = req.body;
+  const { id } = req.body;
   if (!id) {
     return res.status(400).json({ error: 'Missing job id' });
   }
 
-  const db = await readDatabase();
-  const job = db.jobs.find(j => j.id === id);
-  if (!job) {
-    return res.status(404).json({ error: 'Job not found' });
+  try {
+    const db = await readDatabase();
+    const job = db.jobs.find(j => j.id === id);
+    if (!job) {
+      return res.status(404).json({ error: 'Job not found' });
+    }
+
+    const config = await readConfig();
+    const exporter = require('./exporter');
+    
+    systemLog(`Generating application assets for "${job.title}" at ${job.company}...`, 'info');
+    
+    const result = await exporter.exportJobAssets(job, config, systemLog);
+    
+    if (result.success) {
+      await mutateDatabase(dbMut => {
+        const targetJob = dbMut.jobs.find(j => j.id === id);
+        if (targetJob) {
+          targetJob.status = 'exported';
+          targetJob.folderPath = result.relativePath;
+          if (!targetJob.submissionLogs) targetJob.submissionLogs = [];
+          targetJob.submissionLogs.push(`[${new Date().toISOString()}] Assets successfully generated in: ${result.relativePath}`);
+        }
+      });
+      
+      // Option A: Send the full application kit (details + PDF resume + cover letter) to Telegram/Email as a mobile backup
+      try {
+        systemLog(`Sending job application kit to Telegram/Email as mobile backup...`, 'info');
+        await notifier.sendJobApplicationKit({ ...job, status: 'exported' }, systemLog, config, true);
+      } catch (alertErr) {
+        systemLog(`Failed to send Telegram backup: ${alertErr.message}`, 'warning');
+      }
+
+      systemLog(`Assets exported successfully to: ${result.relativePath}`, 'success');
+      return res.json({ 
+        success: true, 
+        message: `Assets exported to ${result.relativePath}`, 
+        relativePath: result.relativePath 
+      });
+    } else {
+      systemLog(`Failed to export assets: ${result.error}`, 'error');
+      return res.status(500).json({ error: `Export failed: ${result.error}` });
+    }
+  } catch (err) {
+    systemLog(`Error during asset export: ${err.message}`, 'error');
+    return res.status(500).json({ error: err.message });
   }
+});
 
-  // Rate limiting check: Max 30 submissions per day
-  const today = new Date().toISOString().split('T')[0];
-  const submittedToday = db.jobs.filter(j => 
-    j.status === 'submitted' && 
-    j.submissionLogs && 
-    j.submissionLogs.some(log => log.includes(today))
-  ).length;
-
-  if (submittedToday >= 30 && !force) {
-    systemLog('Rate limit reached: Max 30 submissions/day. Application queued.', 'warning');
-    return res.status(400).json({ error: 'Daily application rate limit reached (30/day).' });
+// STAGE 7 - Mark Job as Manually Applied
+app.post('/api/jobs/mark-applied', async (req, res) => {
+  const { id } = req.body;
+  if (!id) {
+    return res.status(400).json({ error: 'Missing job id' });
   }
-
-  res.json({ success: true, message: 'Application process launched' });
 
   try {
-    const config = await readConfig();
-    const applier = getApplierModule();
-    
-    systemLog(`Launching Playwright browser to apply for "${job.title}" at ${job.company}...`, 'info');
-    
-    const result = await applier.applyToJob(job, config, systemLog);
-    
+    const db = await readDatabase();
+    const job = db.jobs.find(j => j.id === id);
+    if (!job) {
+      return res.status(404).json({ error: 'Job not found' });
+    }
+
     await mutateDatabase(dbMut => {
       const targetJob = dbMut.jobs.find(j => j.id === id);
       if (targetJob) {
+        targetJob.status = 'submitted';
         if (!targetJob.submissionLogs) targetJob.submissionLogs = [];
-        if (result.needReview) {
-          targetJob.status = 'review';
-          targetJob.submissionLogs.push(`[${new Date().toISOString()}] Form requires manual input: ${result.message}`);
-          systemLog(`Application paused: manual review required: ${result.message}`, 'warning');
-          notifier.sendJobApplicationKit(targetJob, systemLog, config);
-        } else if (result.success) {
-          targetJob.status = 'submitted';
-          targetJob.submissionLogs.push(`[${new Date().toISOString()}] Successfully applied via automated browser.`);
-          systemLog(`Successfully applied to "${job.title}" at ${job.company}!`, 'success');
-        } else {
-          targetJob.submissionLogs.push(`[${new Date().toISOString()}] Application failed: ${result.message}`);
-          systemLog(`Failed to apply to "${job.title}" at ${job.company}: ${result.message}`, 'error');
-        }
+        targetJob.submissionLogs.push(`[${new Date().toISOString()}] Manually applied and marked as submitted.`);
       }
     });
-    
+
+    systemLog(`Job "${job.title}" at ${job.company} marked as manually applied.`, 'success');
+    return res.json({ success: true, message: 'Job marked as applied.' });
   } catch (err) {
-    systemLog(`Error during application execution: ${err.message}`, 'error');
+    systemLog(`Error marking job as applied: ${err.message}`, 'error');
+    return res.status(500).json({ error: err.message });
   }
 });
 
@@ -767,15 +821,6 @@ app.post('/api/jobs/send-alert', async (req, res) => {
     systemLog(`Failed manual Alerts send: ${err.message}`, 'error');
     res.status(500).json({ error: `Failed to send to Alerts: ${err.message}` });
   }
-});
-
-// Sandbox Endpoints for Testing
-app.get('/sandbox', (req, res) => {
-  res.sendFile(path.join(__dirname, 'sandbox.html'));
-});
-
-app.get('/sandbox-success', (req, res) => {
-  res.send('<h1>Application Submitted Successfully (Sandbox)!</h1><p>Query parameters: ' + JSON.stringify(req.query) + '</p>');
 });
 
 // LLM Provider Status Endpoint
@@ -909,6 +954,63 @@ app.post('/api/browser/launch', (req, res) => {
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 let isAutoDiscoveryRunning = false;
+let isAutoApplyRunning = false; // Separate lock — apply sessions can outlive the discovery cycle
+const APPLY_TIMEOUT_MS = 15 * 60 * 1000; // 15-minute max per job application
+
+// --- Daily Apify Budget Tracker (File-Persisted) ---
+const APIFY_BUDGET_FILE = path.join(__dirname, '..', 'apify_budget.json');
+
+function loadApifyBudget() {
+  try {
+    if (fs.existsSync(APIFY_BUDGET_FILE)) {
+      const data = JSON.parse(fs.readFileSync(APIFY_BUDGET_FILE, 'utf8'));
+      const today = new Date().toDateString();
+      if (data.date === today) {
+        return { count: data.count || 0, date: today, sourceIndex: data.sourceIndex || 0 };
+      }
+    }
+  } catch (_) {}
+  return { count: 0, date: new Date().toDateString(), sourceIndex: 0 };
+}
+
+function saveApifyBudget(count, date, sourceIndex) {
+  try {
+    fs.writeFileSync(APIFY_BUDGET_FILE, JSON.stringify({ count, date, sourceIndex }, null, 2), 'utf8');
+  } catch (_) {}
+}
+
+// Load persisted state on startup
+let _budget = loadApifyBudget();
+let apifyDailyCount = _budget.count;
+let apifyBudgetResetDate = _budget.date;
+
+function getApifyBudgetStatus(config) {
+  const today = new Date().toDateString();
+  if (apifyBudgetResetDate !== today) {
+    apifyDailyCount = 0;
+    apifyBudgetResetDate = today;
+    saveApifyBudget(0, today, localSourceIndex);
+    systemLog('[Apify Budget] Daily counter reset for new day.', 'info');
+  }
+  const limit = config.apifyDailyLimit || 3;
+  return { used: apifyDailyCount, limit, available: apifyDailyCount < limit };
+}
+
+function incrementApifyBudget() {
+  apifyDailyCount++;
+  saveApifyBudget(apifyDailyCount, apifyBudgetResetDate, localSourceIndex);
+}
+
+// --- Round-Robin Source Rotation (File-Persisted) ---
+const LOCAL_SOURCES = ['linkedin', 'indeed', 'gulftalent', 'google'];
+let localSourceIndex = _budget.sourceIndex || 0; // resume from last source
+function getNextLocalSource() {
+  const source = LOCAL_SOURCES[localSourceIndex % LOCAL_SOURCES.length];
+  localSourceIndex++;
+  saveApifyBudget(apifyDailyCount, apifyBudgetResetDate, localSourceIndex); // persist rotation
+  return source;
+}
+
 
 // 24/7 background scheduler loop
 async function runAutoDiscovery() {
@@ -949,13 +1051,32 @@ async function runAutoDiscovery() {
     
     const jobsToSyncMap = new Map();
     const llmDelay = config.delayBetweenLlmCallsMs || 5000;
-    
+
+    // --- Round-Robin: pick which local source runs this cycle ---
+    const activeSource = getNextLocalSource();
+
+    // --- Apify daily budget gate (boosts LinkedIn/Indeed cycles only) ---
+    const apifyBudget = getApifyBudgetStatus(config);
+    const apifyBoostAllowed = ['linkedin', 'indeed'].includes(activeSource);
+    let cycleConfig = config;
+    if (config.apifyEnabled && apifyBudget.available && apifyBoostAllowed) {
+      systemLog(`[Apify Budget] Apify cloud boost active for "${activeSource}" cycle (${apifyBudget.used}/${apifyBudget.limit} uses today).`, 'info');
+      incrementApifyBudget();
+    } else if (config.apifyEnabled && !apifyBudget.available) {
+      systemLog(`[Apify Budget] Daily limit reached (${apifyBudget.used}/${apifyBudget.limit} uses). Local-only this cycle.`, 'warning');
+      cycleConfig = { ...config, apifyEnabled: false };
+    } else {
+      cycleConfig = { ...config, apifyEnabled: false }; // GulfTalent/Google cycles don't need Apify
+    }
+
+    systemLog(`[Auto-Discovery] 🔄 This cycle source: ${activeSource.toUpperCase()}`, 'info');
+
     for (let i = 0; i < selectedCombos.length; i++) {
       const { role, loc } = selectedCombos[i];
       systemLog(`[Auto-Discovery] Running scraper for Keyword: "${role}", Location: "${loc}" (Combo ${i+1}/${selectedCombos.length})...`, 'info');
       try {
         const scraper = getScraperModule();
-        const jobs = await scraper.scrapeJobs(role, loc, config, systemLog);
+        const jobs = await scraper.scrapeJobs(role, loc, cycleConfig, systemLog, null, activeSource);
         let comboNewCount = 0;
         const newJobsForCombo = [];
 
@@ -1023,12 +1144,9 @@ async function runAutoDiscovery() {
         try {
           const result = await llm.scoreJob(job, config);
           let newStatus;
-          if (result.score >= 7) {
+          if (result.score >= 6) {
             newStatus = 'scored';
             systemLog(`[Auto-Discovery] Job passed scoring! Score: ${result.score}/10. Reason: ${result.reason}`, 'success');
-          } else if (result.score === 6) {
-            newStatus = 'review';
-            systemLog(`[Auto-Discovery] Job scored borderline (6/10). Added to Human Review Queue. Reason: ${result.reason}`, 'warning');
           } else {
             newStatus = 'skipped';
             systemLog(`[Auto-Discovery] Job filtered out. Score: ${result.score}/10. Reason: ${result.reason}`, 'info');
@@ -1083,12 +1201,8 @@ async function runAutoDiscovery() {
           await delay(llmDelay);
           const confidence = await llm.calculateConfidence(job, analysis, tailoredResume, coverLetter, config);
 
-          const newStatus = (confidence >= 80 && !analysis.dealBreaker) ? 'ready' : 'review';
-          if (newStatus === 'ready') {
-            systemLog(`[Auto-Discovery] Job analysis ready! Confidence score: ${confidence}%. Ready to apply.`, 'success');
-          } else {
-            systemLog(`[Auto-Discovery] Job analysis complete but flagged for human review (Confidence: ${confidence}%, Dealbreaker: ${analysis.dealBreaker || 'None'}).`, 'warning');
-          }
+          const newStatus = 'ready';
+          systemLog(`[Auto-Discovery] Job analysis ready! Confidence score: ${confidence}%. Ready to apply.`, 'success');
 
           // Compose temp job for Alerts before writing to DB
           const tempJob = { ...job, analysis, tailoredResume, coverLetter, coldEmail, confidence, status: newStatus };
@@ -1125,70 +1239,57 @@ async function runAutoDiscovery() {
       systemLog('[Auto-Discovery] No high-scoring jobs to analyze.', 'info');
     }
     
-    // Stage 6 - Auto-Apply to 'ready' jobs
+    // Stage 6 - Auto-Export (Generate assets) for 'ready' jobs — always runs
     const applyConfig = await readConfig();
-    if (applyConfig.autoApplyEnabled !== false) {
-      const applyDb = await readDatabase();
-      const readyJobs = applyDb.jobs.filter(j => j.status === 'ready');
-      const maxApply = applyConfig.maxJobsAppliedPerRun || 5;
+    const applyDb = await readDatabase();
+    const readyJobs = applyDb.jobs.filter(j => j.status === 'ready' && !j.folderPath);
+    const maxApply = applyConfig.maxJobsAppliedPerRun || 5;
+    const toApply = readyJobs.slice(0, maxApply);
 
-      const today = new Date().toISOString().split('T')[0];
-      const submittedToday = applyDb.jobs.filter(j =>
-        j.status === 'submitted' &&
-        j.submissionLogs &&
-        j.submissionLogs.some(log => log.includes(today))
-      ).length;
+    if (readyJobs.length === 0) {
+      systemLog('[Auto-Export] No jobs in "ready" state to export.', 'info');
+    } else {
+      systemLog(`[Auto-Export] ${readyJobs.length} job(s) ready. Exporting assets for ${toApply.length} this cycle...`, 'info');
+      const exporter = require('./exporter');
 
-      const remaining = Math.max(0, 30 - submittedToday);
-      const toApply = readyJobs.slice(0, Math.min(maxApply, remaining));
+      for (let i = 0; i < toApply.length; i++) {
+        const job = toApply[i];
+        systemLog(`[Auto-Export] Generating assets for job ${i + 1}/${toApply.length}: "${job.title}" at ${job.company}...`, 'info');
+        try {
+          const result = await exporter.exportJobAssets(job, applyConfig, systemLog);
 
-      if (readyJobs.length === 0) {
-        systemLog('[Auto-Apply] No jobs in "ready" state to apply to.', 'info');
-      } else if (remaining === 0) {
-        systemLog('[Auto-Apply] Daily application limit reached (30/day). Will resume tomorrow.', 'warning');
-      } else {
-        systemLog(`[Auto-Apply] ${readyJobs.length} job(s) ready. Applying to ${toApply.length} this cycle (Daily quota: ${submittedToday}/30 used, ${remaining} remaining)...`, 'info');
-        const applier = getApplierModule();
+          await mutateDatabase(db => {
+            const freshJob = db.jobs.find(j => j.id === job.id);
+            if (!freshJob) return;
+            freshJob.submissionLogs = freshJob.submissionLogs || [];
+            if (result.success) {
+              freshJob.status = 'exported';
+              freshJob.folderPath = result.relativePath;
+              freshJob.submissionLogs.push(`[${new Date().toISOString()}] Assets auto-generated in: ${result.relativePath}`);
+              systemLog(`[Auto-Export] ✅ Successfully generated assets for "${job.title}" at ${job.company}!`, 'success');
+              jobsToSyncMap.set(freshJob.id, { ...freshJob });
+            } else {
+              freshJob.submissionLogs.push(`[${new Date().toISOString()}] Auto-export failed: ${result.error}`);
+              systemLog(`[Auto-Export] ❌ Failed to generate assets for "${job.title}": ${result.error}`, 'error');
+            }
+          });
 
-        for (let i = 0; i < toApply.length; i++) {
-          const job = toApply[i];
-          systemLog(`[Auto-Apply] Applying to job ${i + 1}/${toApply.length}: "${job.title}" at ${job.company}...`, 'info');
+          // Send Telegram notification for newly exported job
           try {
-            const result = await applier.applyToJob(job, applyConfig, systemLog);
-
-            await mutateDatabase(db => {
-              const freshJob = db.jobs.find(j => j.id === job.id);
-              if (!freshJob) return;
-              freshJob.submissionLogs = freshJob.submissionLogs || [];
-              if (result.success && !result.needReview) {
-                freshJob.status = 'submitted';
-                freshJob.submissionLogs.push(`[${new Date().toISOString()}] Auto-applied via automated browser.`);
-                systemLog(`[Auto-Apply] ✅ Successfully applied to "${job.title}" at ${job.company}!`, 'success');
-                jobsToSyncMap.set(freshJob.id, { ...freshJob });
-              } else if (result.needReview) {
-                freshJob.status = 'review';
-                freshJob.submissionLogs.push(`[${new Date().toISOString()}] Auto-apply paused: ${result.message}`);
-                systemLog(`[Auto-Apply] ⚠️ Application for "${job.title}" requires manual review: ${result.message}`, 'warning');
-                jobsToSyncMap.set(freshJob.id, { ...freshJob });
-                notifier.sendJobApplicationKit(freshJob, systemLog, applyConfig);
-              } else {
-                freshJob.submissionLogs.push(`[${new Date().toISOString()}] Auto-apply failed: ${result.message}`);
-                systemLog(`[Auto-Apply] ❌ Failed to apply to "${job.title}": ${result.message}`, 'error');
-              }
-            });
-          } catch (err) {
-            systemLog(`[Auto-Apply] Error applying to "${job.title}" at ${job.company}: ${err.message}`, 'error');
+            await notifier.sendJobApplicationKit({ ...job, status: 'exported' }, systemLog, applyConfig, true);
+          } catch (tgErr) {
+            systemLog(`[Auto-Export] Telegram notification failed: ${tgErr.message}`, 'warning');
           }
+        } catch (err) {
+          systemLog(`[Auto-Export] ❌ Error exporting assets for "${job.title}" at ${job.company}: ${err.message}`, 'error');
+        }
 
-          if (i < toApply.length - 1) {
-            systemLog(`[Auto-Apply] Waiting 30 seconds before next application...`, 'info');
-            await delay(30000);
-          }
+        if (i < toApply.length - 1) {
+          await delay(1000);
         }
       }
-    } else {
-      systemLog('[Auto-Apply] Auto-apply is disabled in configuration. Skipping.', 'info');
     }
+
 
     // Sync to Google Sheets (single batch call)
     if (jobsToSyncMap.size > 0) {
@@ -1270,8 +1371,7 @@ app.post('/api/scoreNow', async (req, res) => {
       try {
         const result = await llm.scoreJob(job, config);
         let newStatus;
-        if (result.score >= 7) { newStatus = 'scored'; systemLog(`[scoreNow] ✅ ${result.score}/10 — ${job.title}`, 'success'); }
-        else if (result.score === 6) { newStatus = 'review'; systemLog(`[scoreNow] ⚠️ 6/10 borderline — ${job.title}`, 'warning'); }
+        if (result.score >= 6) { newStatus = 'scored'; systemLog(`[scoreNow] ✅ ${result.score}/10 — ${job.title}`, 'success'); }
         else { newStatus = 'skipped'; systemLog(`[scoreNow] ❌ ${result.score}/10 skipped — ${job.title}`, 'info'); }
         await mutateDatabase(db => {
           const t = db.jobs.find(j => j.id === job.id);
@@ -1300,7 +1400,7 @@ app.post('/api/scoreNow', async (req, res) => {
         const coverLetter = await llm.generateCoverLetter(job, analysis, config); await delay(llmDelay);
         const coldEmail = await llm.generateColdEmail(job, analysis, config, job.poster || null); await delay(llmDelay);
         const confidence = await llm.calculateConfidence(job, analysis, tailoredResume, coverLetter, config);
-        const newStatus = (confidence >= 80 && !analysis.dealBreaker) ? 'ready' : 'review';
+        const newStatus = 'ready';
         systemLog(`[scoreNow] Analysis done — ${job.title} → ${newStatus} (${confidence}%)`, 'success');
 
         // Send to Alerts automatically
@@ -1338,6 +1438,790 @@ app.post('/api/scoreNow', async (req, res) => {
   }
 });
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// LinkedIn Recruiter Outreach Manual Trigger
+// ═══════════════════════════════════════════════════════════════════════════════
+app.post('/api/jobs/linkedin-connect', async (req, res) => {
+  const { id } = req.body;
+  if (!id) return res.status(400).json({ error: 'Missing job id' });
+
+  const db = await readDatabase();
+  const job = db.jobs.find(j => j.id === id);
+  if (!job) return res.status(404).json({ error: 'Job not found' });
+  if (!job.poster || !job.poster.url) return res.status(400).json({ error: 'This job does not have recruiter LinkedIn details.' });
+
+  res.json({ success: true, message: 'LinkedIn outreach process launched.' });
+
+  try {
+    const config = await readConfig();
+    const llm = getLlmProvider();
+    systemLog(`Generating connection message for "${job.title}"...`, 'info');
+    const note = await llm.generateConnectionMessage(job, job.analysis, config, job.poster);
+
+    systemLog(`Starting LinkedIn connection invite via Playwright...`, 'info');
+    const outreach = require('./linkedin_outreach');
+    const result = await outreach.sendLinkedInConnect(job, note, db, systemLog);
+
+    if (result.success) {
+      await mutateDatabase(dbMut => {
+        const targetJob = dbMut.jobs.find(j => j.id === id);
+        if (targetJob) {
+          targetJob.connectionSent = result.action;
+          targetJob.connectionError = null;
+        }
+        dbMut.linkedinOutreach = db.linkedinOutreach;
+      });
+      systemLog(`LinkedIn outreach succeeded: ${result.message}`, 'success');
+    } else {
+      await mutateDatabase(dbMut => {
+        const targetJob = dbMut.jobs.find(j => j.id === id);
+        if (targetJob) targetJob.connectionError = result.message;
+      });
+      systemLog(`LinkedIn outreach failed: ${result.message}`, 'error');
+    }
+  } catch (err) {
+    systemLog(`Error during LinkedIn outreach: ${err.message}`, 'error');
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Daily Morning Report — Telegram
+// ═══════════════════════════════════════════════════════════════════════════════
+async function sendDailyReport(targetChatId = null) {
+  const config = await readConfig();
+  const chatId = targetChatId || config.telegramChatId;
+  if (!config.telegramBotToken || !chatId) {
+    systemLog('[Daily Report] Telegram not configured. Skipping report.', 'warning');
+    return;
+  }
+
+  const db = await readDatabase();
+  const jobs = db.jobs || [];
+  const today = new Date();
+  const yesterday = new Date(today);
+  yesterday.setDate(yesterday.getDate() - 1);
+  const yesterdayStr = yesterday.toISOString().split('T')[0];
+  const todayStr = today.toISOString().split('T')[0];
+
+  const discoveredYesterday = jobs.filter(j => {
+    if (!j.timestamp) return false;
+    const d = j.timestamp.split('T')[0];
+    return d === yesterdayStr || d === todayStr;
+  });
+
+  const portalCounts = {
+    LinkedIn: 0,
+    Indeed: 0,
+    GulfTalent: 0,
+    'Google Jobs': 0,
+    'Other/Direct': 0
+  };
+
+  discoveredYesterday.forEach(j => {
+    const url = (j.url || '').toLowerCase();
+    if (url.includes('linkedin.com')) {
+      portalCounts.LinkedIn++;
+    } else if (url.includes('indeed.com')) {
+      portalCounts.Indeed++;
+    } else if (url.includes('gulftalent.com')) {
+      portalCounts.GulfTalent++;
+    } else if (url.includes('google.com') || url.includes('google_jobs') || url.includes('jobsora.com')) {
+      portalCounts['Google Jobs']++;
+    } else {
+      portalCounts['Other/Direct']++;
+    }
+  });
+
+  const submittedAll = jobs.filter(j => j.status === 'submitted');
+  const submittedRecent = submittedAll.filter(j =>
+    j.submissionLogs && j.submissionLogs.some(log => log.includes(yesterdayStr) || log.includes(todayStr))
+  );
+
+  const readyJobs = jobs.filter(j => j.status === 'ready');
+  const reviewJobs = jobs.filter(j => j.status === 'review');
+  const scoredJobs = jobs.filter(j => j.status === 'scored');
+  const skippedJobs = jobs.filter(j => j.status === 'skipped');
+
+  const topOpportunities = jobs
+    .filter(j => (j.status === 'ready' || j.status === 'review' || j.status === 'submitted') && j.confidence)
+    .sort((a, b) => (b.confidence || 0) - (a.confidence || 0))
+    .slice(0, 5);
+
+  const appliedWithConfidence = submittedAll.filter(j => j.confidence);
+  const avgConfidence = appliedWithConfidence.length > 0
+    ? Math.round(appliedWithConfidence.reduce((sum, j) => sum + j.confidence, 0) / appliedWithConfidence.length)
+    : 0;
+
+  const outreach = db.linkedinOutreach || {};
+  const connectionsToday = (outreach.date === todayStr || outreach.date === yesterdayStr) ? (outreach.count || 0) : 0;
+
+  let msg = `📊 *abhii Daily Report*\n`;
+  msg += `📅 ${esc(today.toLocaleDateString('en-IN', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' }))}\n\n`;
+
+  msg += `*── Pipeline Summary ──*\n`;
+  msg += `🔍 New Jobs Discovered: *${discoveredYesterday.length}*\n`;
+  if (discoveredYesterday.length > 0) {
+    if (portalCounts.LinkedIn > 0) msg += `   • LinkedIn: *${portalCounts.LinkedIn}*\n`;
+    if (portalCounts.Indeed > 0) msg += `   • Indeed: *${portalCounts.Indeed}*\n`;
+    if (portalCounts.GulfTalent > 0) msg += `   • GulfTalent: *${portalCounts.GulfTalent}*\n`;
+    if (portalCounts['Google Jobs'] > 0) msg += `   • Google Jobs: *${portalCounts['Google Jobs']}*\n`;
+    if (portalCounts['Other/Direct'] > 0) msg += `   • Other/Direct: *${portalCounts['Other/Direct']}*\n`;
+  }
+  msg += `📋 Jobs Scored \\(Pending\\): *${scoredJobs.length}*\n`;
+  msg += `⏳ Awaiting Review: *${reviewJobs.length}*\n`;
+  msg += `✅ Ready to Apply: *${readyJobs.length}*\n`;
+  msg += `🚀 Applied \\(Recent\\): *${submittedRecent.length}*\n`;
+  msg += `📨 Total Applied \\(All Time\\): *${submittedAll.length}*\n`;
+  msg += `❌ Filtered Out: *${skippedJobs.length}*\n`;
+  msg += `🤝 LinkedIn Connects Sent: *${connectionsToday}*\n\n`;
+
+  if (topOpportunities.length > 0) {
+    msg += `*── 🎯 Top Opportunities ──*\n`;
+    for (const job of topOpportunities) {
+      const statusIcon = job.status === 'submitted' ? '✅' : job.status === 'ready' ? '🟢' : '🟡';
+      msg += `${statusIcon} *${esc(job.title)}*\n`;
+      msg += `   📍 ${esc(job.company)} \\| ${esc(job.location || 'N/A')}\n`;
+      msg += `   📊 Confidence: *${job.confidence}%* \\| Score: *${job.score || '?'}/10*\n`;
+      msg += `   Status: _${esc(job.status)}_\n\n`;
+    }
+  }
+
+  msg += `*── 📈 Success Estimate ──*\n`;
+  if (appliedWithConfidence.length > 0) {
+    msg += `Average confidence across ${appliedWithConfidence.length} applied jobs: *${avgConfidence}%*\n`;
+    const estimatedCallbacks = Math.max(1, Math.round(appliedWithConfidence.length * (avgConfidence / 100) * 0.15));
+    msg += `Estimated interview callbacks: *${estimatedCallbacks}\\-${estimatedCallbacks + 2}* \\(based on ${avgConfidence}% avg confidence\\)\n\n`;
+  } else {
+    msg += `No applications with confidence data yet\\.\n\n`;
+  }
+
+  msg += `_Report generated at ${esc(today.toLocaleTimeString('en-IN'))}_`;
+
+  try {
+    const TelegramBot = require('node-telegram-bot-api');
+    const bot = new TelegramBot(config.telegramBotToken);
+    await bot.sendMessage(chatId, msg, { parse_mode: 'MarkdownV2' });
+    systemLog('[Daily Report] ✅ Morning report sent to Telegram.', 'success');
+  } catch (err) {
+    systemLog(`[Daily Report] Failed to send report: ${err.message}`, 'error');
+    try {
+      const TelegramBot = require('node-telegram-bot-api');
+      const bot = new TelegramBot(config.telegramBotToken);
+      const plainMsg = msg.replace(/[\\*_`]/g, '');
+      await bot.sendMessage(chatId, plainMsg);
+      systemLog('[Daily Report] Sent report in plain text fallback.', 'info');
+    } catch (e2) {
+      systemLog(`[Daily Report] Plain text fallback also failed: ${e2.message}`, 'error');
+    }
+  }
+}
+
+function startDailyReportScheduler() {
+  readConfig().then(config => {
+    if (!config.dailyReportEnabled) {
+      systemLog('[Daily Report] Disabled in configuration.', 'info');
+      return;
+    }
+    const targetHourIST = config.dailyReportHourIST || 8;
+    const now = new Date();
+    const istOffset = 5.5 * 60 * 60 * 1000;
+    const nowIST = new Date(now.getTime() + istOffset);
+    let nextRun = new Date(nowIST);
+    nextRun.setHours(targetHourIST, 0, 0, 0);
+    if (nowIST >= nextRun) nextRun.setDate(nextRun.getDate() + 1);
+    const msUntilNext = nextRun.getTime() - nowIST.getTime();
+    const hoursUntil = (msUntilNext / (1000 * 60 * 60)).toFixed(1);
+    systemLog(`[Daily Report] Scheduled for ${targetHourIST}:00 IST daily. Next report in ~${hoursUntil} hours.`, 'system');
+    setTimeout(() => {
+      sendDailyReport();
+      setInterval(() => sendDailyReport(), 24 * 60 * 60 * 1000);
+    }, msUntilNext);
+  });
+}
+
+app.post('/api/send-daily-report', async (req, res) => {
+  res.json({ success: true, message: 'Daily report triggered. Check Telegram.' });
+  sendDailyReport().catch(err => systemLog(`[Daily Report] Manual trigger error: ${err.message}`, 'error'));
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Telegram Link & Command Listener
+// ═══════════════════════════════════════════════════════════════════════════════
+const pendingQuestions = new Map();
+let telegramBotInstance = null;
+
+function esc(text) {
+  return (text || '').replace(/[_*[\]()~`>#+=|{}.!-]/g, '\\$&');
+}
+
+function escHtml(text) {
+  return (text || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+async function askUserQuestion(job, questionText, type, options = []) {
+  const config = await readConfig();
+  if (!config.telegramBotToken || !config.telegramChatId) {
+    throw new Error('Telegram not configured.');
+  }
+
+  // 1. Check Q&A Memory Bank first!
+  const db = await readDatabase();
+  db.savedAnswers = db.savedAnswers || {};
+  const normQ = (questionText || '').toLowerCase().replace(/[^a-z0-9]/g, ' ').replace(/\s+/g, ' ').trim();
+  if (normQ && db.savedAnswers[normQ]) {
+    systemLog(`[Q&A Memory] Automatically answered: "${questionText}" -> "${db.savedAnswers[normQ]}"`, 'success');
+    return db.savedAnswers[normQ];
+  }
+
+  // 2. Build the interactive prompt
+  const TelegramBot = require('node-telegram-bot-api');
+  const bot = new TelegramBot(config.telegramBotToken);
+  
+  let promptMsg = `❓ <b>Question Alert for ${escHtml(job.company)}</b>\n` +
+    `<b>${escHtml(job.title)}</b>\n\n` +
+    `Question: <i>${escHtml(questionText)}</i>\n\n`;
+    
+  if (options.length > 0) {
+    promptMsg += `Options:\n` + options.map((opt, idx) => `${idx + 1}. ${escHtml(opt)}`).join('\n') + `\n\n`;
+    promptMsg += `💡 <b>Reply with the number (e.g. 1) or the text of your choice.</b>`;
+  } else {
+    promptMsg += `💡 <b>Reply directly to this message with your answer.</b>`;
+  }
+
+  const sentMessage = await bot.sendMessage(config.telegramChatId, promptMsg, { parse_mode: 'HTML' });
+
+  // 3. Register in pending map
+  return new Promise((resolve) => {
+    pendingQuestions.set(sentMessage.message_id.toString(), {
+      resolve: async (answer) => {
+        // Save to Q&A database for future use!
+        await mutateDatabase(dbMut => {
+          dbMut.savedAnswers = dbMut.savedAnswers || {};
+          dbMut.savedAnswers[normQ] = answer;
+        });
+        resolve(answer);
+      },
+      questionText,
+      options
+    });
+  });
+}
+
+const askTelegramFn = (job) => {
+  return async (questionText, type, options = []) => {
+    return askUserQuestion(job, questionText, type, options);
+  };
+};
+
+function initTelegramBotListener(config) {
+  if (!config.telegramBotToken || !config.telegramChatId) {
+    systemLog('[Telegram Listener] Token or Chat ID not configured. Link listener disabled.', 'warning');
+    return;
+  }
+
+  try {
+    const TelegramBot = require('node-telegram-bot-api');
+    systemLog('[Telegram Listener] Starting link listener polling...', 'info');
+    
+    telegramBotInstance = new TelegramBot(config.telegramBotToken, {
+      polling: true,
+      request: { agentOptions: { family: 4 } }
+    });
+    
+    telegramBotInstance.on('message', async (msg) => {
+      const chatId = msg.chat.id.toString();
+      if (chatId !== config.telegramChatId.toString()) return; // Security check
+
+      const text = (msg.text || '').trim();
+
+      // Intercept replies to pending questions
+      if (msg.reply_to_message && pendingQuestions.has(msg.reply_to_message.message_id.toString())) {
+        const pending = pendingQuestions.get(msg.reply_to_message.message_id.toString());
+        let answer = text;
+        
+        if (pending.options && pending.options.length > 0) {
+          const idx = parseInt(text.trim(), 10);
+          if (!isNaN(idx) && idx >= 1 && idx <= pending.options.length) {
+            answer = pending.options[idx - 1];
+          }
+        }
+
+        systemLog(`[Telegram Listener] User answered: "${pending.questionText}" -> "${answer}"`, 'info');
+        pending.resolve(answer);
+        pendingQuestions.delete(msg.reply_to_message.message_id.toString());
+        await telegramBotInstance.sendMessage(chatId, `✅ Saved answer: *${esc(answer)}*`, { parse_mode: 'MarkdownV2' });
+        return;
+      }
+
+      if (text.startsWith('http://') || text.startsWith('https://')) {
+        systemLog(`[Telegram Listener] Received job URL from chat: ${text}`, 'info');
+        processTelegramImportLink(telegramBotInstance, chatId, text).catch(err => {
+          systemLog(`[Telegram Listener] Error processing link: ${err.message}`, 'error');
+        });
+      } else if (text.startsWith('/')) {
+        const command = text.split(' ')[0].toLowerCase();
+        systemLog(`[Telegram Listener] Received command from bot chat: ${command}`, 'info');
+        
+        try {
+          if (command === '/help' || command === '/start') {
+            const helpMsg = `🤖 *abhii Bot Commands:*\n\n` +
+              `• \`/help\` \\- Show this command list\n` +
+              `• \`/report\` \\- Send the daily pipeline report immediately\n` +
+              `• \`/stats\` \\- View current job database stats\n` +
+              `• \`/outreach\` \\- View today\\'s LinkedIn connection stats\n` +
+              `• \`/applied\` \\- Show the last 5 applied jobs\n` +
+              `• \`/apply\` \\- Reply to a job message with this command to apply\n` +
+              `• \`/run\` \\- Trigger a full job scraper run now\n` +
+              `• \`/interested\` \\- List all interested jobs with apply links\n` +
+              `• \`/maybe\` \\- List all maybe jobs with apply links\n` +
+              `• \`/not_interested\` \\- List all not interested jobs\n` +
+              `• \`/tag_interested\` \\- Reply to a job card to tag it as Interested\n` +
+              `• \`/tag_maybe\` \\- Reply to a job card to tag it as Maybe\n` +
+              `• \`/tag_not_interested\` \\- Reply to a job card to tag it as Not Interested\n\n` +
+              `💡 *Tip:* Tapping \`/apply_job_xxxx\` links on alert cards or list results will let you trigger the browser application manually\\!`;
+            await telegramBotInstance.sendMessage(chatId, helpMsg, { parse_mode: 'MarkdownV2' });
+          } 
+          else if (command === '/report') {
+            await telegramBotInstance.sendMessage(chatId, `⏳ Generating pipeline report...`);
+            await sendDailyReport(chatId);
+          } 
+          else if (command === '/stats') {
+            const db = await readDatabase();
+            const jobs = db.jobs || [];
+            const scored = jobs.filter(j => j.status === 'scored').length;
+            const review = jobs.filter(j => j.status === 'review').length;
+            const ready = jobs.filter(j => j.status === 'ready').length;
+            const submitted = jobs.filter(j => j.status === 'submitted').length;
+            const skipped = jobs.filter(j => j.status === 'skipped').length;
+            
+            const interested = jobs.filter(j => j.tag === 'interested').length;
+            const maybe = jobs.filter(j => j.tag === 'maybe').length;
+            const notInterested = jobs.filter(j => j.tag === 'not_interested').length;
+            
+            // Portal breakdown of tracked jobs (non-skipped)
+            const trackedJobs = jobs.filter(j => j.status !== 'skipped');
+            const portalTotals = { LinkedIn: 0, Indeed: 0, GulfTalent: 0, 'Google Jobs': 0, 'Other/Direct': 0 };
+            trackedJobs.forEach(j => {
+              const url = (j.url || '').toLowerCase();
+              if (url.includes('linkedin.com')) portalTotals.LinkedIn++;
+              else if (url.includes('indeed.com')) portalTotals.Indeed++;
+              else if (url.includes('gulftalent.com')) portalTotals.GulfTalent++;
+              else if (url.includes('google.com') || url.includes('google_jobs') || url.includes('jobsora.com')) portalTotals['Google Jobs']++;
+              else portalTotals['Other/Direct']++;
+            });
+
+            const statsMsg = `📊 *Current Job Pipeline Stats:*\n\n` +
+              `• Scored \\(Pending\\): *${scored}*\n` +
+              `• Awaiting Review: *${review}*\n` +
+              `• Ready to Apply: *${ready}*\n` +
+              `• Applied: *${submitted}*\n` +
+              `• Filtered Out: *${skipped}*\n\n` +
+              `🌐 *By Portal (Tracked):*\n` +
+              `• LinkedIn: *${portalTotals.LinkedIn}*\n` +
+              `• Indeed: *${portalTotals.Indeed}*\n` +
+              `• GulfTalent: *${portalTotals.GulfTalent}*\n` +
+              `• Google Jobs: *${portalTotals['Google Jobs']}*\n` +
+              `• Direct/Other: *${portalTotals['Other/Direct']}*\n\n` +
+              `🏷️ *Tagged Jobs Status:*\n` +
+              `• Interested: *${interested}*\n` +
+              `• Maybe: *${maybe}*\n` +
+              `• Not Interested: *${notInterested}*\n\n` +
+              `Total jobs tracked: *${jobs.length}*`;
+            await telegramBotInstance.sendMessage(chatId, statsMsg, { parse_mode: 'MarkdownV2' });
+          } 
+          else if (command === '/outreach') {
+            const db = await readDatabase();
+            const outreach = db.linkedinOutreach || {};
+            const todayStr = new Date().toISOString().split('T')[0];
+            const count = outreach.date === todayStr ? (outreach.count || 0) : 0;
+            const maxVal = config.linkedinMaxConnectionsPerDay || 30;
+            
+            const outreachMsg = `🤝 *LinkedIn Connection Stats:*\n\n` +
+              `• Sent Today: *${count} / ${maxVal}*\n` +
+              `• Date: *${esc(todayStr)}*`;
+            await telegramBotInstance.sendMessage(chatId, outreachMsg, { parse_mode: 'MarkdownV2' });
+          }
+          else if (command.startsWith('/tag_interested') || command.startsWith('/tag_maybe') || command.startsWith('/tag_not_interested')) {
+            let jobId = '';
+            let tag = '';
+            
+            if (command.startsWith('/tag_interested')) {
+              tag = 'interested';
+              if (command.startsWith('/tag_interested_')) {
+                jobId = command.substring(16).trim();
+              }
+            } else if (command.startsWith('/tag_maybe')) {
+              tag = 'maybe';
+              if (command.startsWith('/tag_maybe_')) {
+                jobId = command.substring(11).trim();
+              }
+            } else if (command.startsWith('/tag_not_interested')) {
+              tag = 'not_interested';
+              if (command.startsWith('/tag_not_interested_')) {
+                jobId = command.substring(20).trim();
+              }
+            }
+
+            // Fallback to reply context if jobId is not in the command
+            if (!jobId && msg.reply_to_message) {
+              const replyText = msg.reply_to_message.text || msg.reply_to_message.caption || '';
+              const db = await readDatabase();
+              const foundJob = db.jobs.find(j => 
+                replyText.includes(j.company) && replyText.includes(j.title)
+              );
+              if (foundJob) {
+                jobId = foundJob.id;
+              }
+            }
+
+            if (!jobId) {
+              await telegramBotInstance.sendMessage(chatId, `❌ Could not identify the job. Reply to a job alert card with \`/tag_interested\`, \`/tag_maybe\`, or \`/tag_not_interested\`.`);
+              return;
+            }
+
+            let jobTitle = '';
+            let jobCompany = '';
+            await mutateDatabase(dbMut => {
+              const job = dbMut.jobs.find(j => j.id === jobId);
+              if (job) {
+                job.tag = tag;
+                jobTitle = job.title;
+                jobCompany = job.company;
+              }
+            });
+
+            if (jobTitle) {
+              const tagLabel = tag.toUpperCase().replace('_', ' ');
+              await telegramBotInstance.sendMessage(chatId, `🔖 Tagged *${esc(jobTitle)}* at *${esc(jobCompany)}* as *${esc(tagLabel)}*`, { parse_mode: 'MarkdownV2' });
+            } else {
+              await telegramBotInstance.sendMessage(chatId, `❌ Job not found in database.`);
+            }
+          }
+          else if (command === '/interested' || command === '/list_interested') {
+            const db = await readDatabase();
+            const matchingJobs = (db.jobs || [])
+              .filter(j => j.tag === 'interested')
+              .sort((a, b) => (b.score || 0) - (a.score || 0));
+
+            if (matchingJobs.length === 0) {
+              await telegramBotInstance.sendMessage(chatId, `No jobs tagged as *INTERESTED* yet\\.`, { parse_mode: 'MarkdownV2' });
+              return;
+            }
+
+            let responseMsg = `🔖 *Interested Jobs (${matchingJobs.length}):*\n\n`;
+            for (const j of matchingJobs) {
+              responseMsg += `• *${esc(j.title)}* at *${esc(j.company)}*\n`;
+              responseMsg += `  Score: *${j.score || '?'}/10* \\| Status: *${j.status || 'scored'}*\n`;
+              responseMsg += `  ⚡ Apply: /apply\\_${j.id}\n`;
+              responseMsg += `  🏷️ Change Tag: /tag\\_maybe\\_${j.id} \\| /tag\\_not\\_interested\\_${j.id}\n\n`;
+            }
+            await telegramBotInstance.sendMessage(chatId, responseMsg, { parse_mode: 'MarkdownV2' });
+          }
+          else if (command === '/maybe' || command === '/list_maybe') {
+            const db = await readDatabase();
+            const matchingJobs = (db.jobs || [])
+              .filter(j => j.tag === 'maybe')
+              .sort((a, b) => (b.score || 0) - (a.score || 0));
+
+            if (matchingJobs.length === 0) {
+              await telegramBotInstance.sendMessage(chatId, `No jobs tagged as *MAYBE* yet\\.`, { parse_mode: 'MarkdownV2' });
+              return;
+            }
+
+            let responseMsg = `🔖 *Maybe Jobs (${matchingJobs.length}):*\n\n`;
+            for (const j of matchingJobs) {
+              responseMsg += `• *${esc(j.title)}* at *${esc(j.company)}*\n`;
+              responseMsg += `  Score: *${j.score || '?'}/10* \\| Status: *${j.status || 'scored'}*\n`;
+              responseMsg += `  ⚡ Apply: /apply\\_${j.id}\n`;
+              responseMsg += `  🏷️ Change Tag: /tag\\_interested\\_${j.id} \\| /tag\\_not\\_interested\\_${j.id}\n\n`;
+            }
+            await telegramBotInstance.sendMessage(chatId, responseMsg, { parse_mode: 'MarkdownV2' });
+          }
+          else if (command === '/not_interested' || command === '/list_not_interested') {
+            const db = await readDatabase();
+            const matchingJobs = (db.jobs || [])
+              .filter(j => j.tag === 'not_interested')
+              .sort((a, b) => (b.score || 0) - (a.score || 0));
+
+            if (matchingJobs.length === 0) {
+              await telegramBotInstance.sendMessage(chatId, `No jobs tagged as *NOT INTERESTED* yet\\.`, { parse_mode: 'MarkdownV2' });
+              return;
+            }
+
+            let responseMsg = `🔖 *Not Interested Jobs (${matchingJobs.length}):*\n\n`;
+            for (const j of matchingJobs) {
+              responseMsg += `• *${esc(j.title)}* at *${esc(j.company)}*\n`;
+              responseMsg += `  Score: *${j.score || '?'}/10* \\| Status: *${j.status || 'scored'}*\n`;
+              responseMsg += `  🏷️ Change Tag: /tag\\_interested\\_${j.id} \\| /tag\\_maybe\\_${j.id}\n\n`;
+            }
+            await telegramBotInstance.sendMessage(chatId, responseMsg, { parse_mode: 'MarkdownV2' });
+          } 
+          else if (command.startsWith('/apply_') || command === '/apply') {
+            let jobId = '';
+            if (command.startsWith('/apply_')) {
+              jobId = command.substring(7).trim();
+            } else if (msg.reply_to_message) {
+              const replyText = msg.reply_to_message.text || msg.reply_to_message.caption || '';
+              const db = await readDatabase();
+              const foundJob = db.jobs.find(j => 
+                replyText.includes(j.company) && replyText.includes(j.title)
+              );
+              if (foundJob) {
+                jobId = foundJob.id;
+              }
+            }
+
+            if (!jobId) {
+              await telegramBotInstance.sendMessage(chatId, `❌ Could not identify the job. Tap the \`/apply_job_xxxx\` link under the job card, or reply to a job card message with \`/apply\`.`);
+              return;
+            }
+
+            const db = await readDatabase();
+            const job = db.jobs.find(j => j.id === jobId);
+            if (!job) {
+              await telegramBotInstance.sendMessage(chatId, `❌ Job not found in database.`);
+              return;
+            }
+
+            await telegramBotInstance.sendMessage(chatId, `⏳ Generating application assets for *${esc(job.title)}* at *${esc(job.company)}*...`, { parse_mode: 'Markdown' });
+
+            try {
+              const exporterConfig = await readConfig();
+              const exporter = require('./exporter');
+              
+              const result = await exporter.exportJobAssets(job, exporterConfig, (msg, type) => {
+                systemLog(`[Telegram /apply Command] ${msg}`, type);
+              });
+
+              if (result.success) {
+                await mutateDatabase(dbMut => {
+                  const targetJob = dbMut.jobs.find(j => j.id === jobId);
+                  if (targetJob) {
+                    targetJob.status = 'exported';
+                    targetJob.folderPath = result.relativePath;
+                    if (!targetJob.submissionLogs) targetJob.submissionLogs = [];
+                    targetJob.submissionLogs.push(`[${new Date().toISOString()}] Assets generated via Telegram command in: ${result.relativePath}`);
+                  }
+                });
+
+                // Option A: Send the full application kit (PDF resume + cover letter) as backup to Telegram
+                try {
+                  await notifier.sendJobApplicationKit({ ...job, status: 'exported' }, systemLog, exporterConfig, true);
+                } catch (err) {
+                  systemLog(`[Telegram Command] Failed to send PDF backup: ${err.message}`, 'warning');
+                }
+
+                const updatedJob = db.jobs.find(j => j.id === jobId);
+                if (updatedJob) {
+                  await syncJobsToGoogleSheets([updatedJob]);
+                }
+
+                let replyMsg = `📁 *Assets Exported Successfully\\!*\n\n`;
+                replyMsg += `• *Folder:* \`${esc(result.relativePath)}\`\n`;
+                replyMsg += `• *Company:* _${esc(job.company)}_\n`;
+                replyMsg += `• *Role:* _${esc(job.title)}_\n\n`;
+                replyMsg += `👉 *Apply Here:* ${esc(job.url || '')}\n\n`;
+                replyMsg += `Tap to mark applied when done:\n👉 /mark\\_applied\\_${job.id}`;
+
+                await telegramBotInstance.sendMessage(chatId, replyMsg, { parse_mode: 'MarkdownV2' });
+              } else {
+                await telegramBotInstance.sendMessage(chatId, `❌ *Asset Export Failed\\!* for *${esc(job.title)}* at *${esc(job.company)}*:\n\n_${esc(result.error || 'Unknown error')}_`, { parse_mode: 'MarkdownV2' });
+              }
+            } catch (err) {
+              systemLog(`[Telegram /apply Command Error] ${err.message}`, 'error');
+              await telegramBotInstance.sendMessage(chatId, `❌ Error exporting assets: ${err.message}`);
+            }
+          }
+          else if (command.startsWith('/mark_applied_')) {
+            const jobId = command.substring(14).trim();
+            const db = await readDatabase();
+            const job = db.jobs.find(j => j.id === jobId);
+            if (!job) {
+              await telegramBotInstance.sendMessage(chatId, `❌ Job not found in database.`);
+              return;
+            }
+            await mutateDatabase(dbMut => {
+              const targetJob = dbMut.jobs.find(j => j.id === jobId);
+              if (targetJob) {
+                targetJob.status = 'submitted';
+                if (!targetJob.submissionLogs) targetJob.submissionLogs = [];
+                targetJob.submissionLogs.push(`[${new Date().toISOString()}] Marked as applied via Telegram command.`);
+              }
+            });
+            const updatedJob = db.jobs.find(j => j.id === jobId);
+            if (updatedJob) {
+              await syncJobsToGoogleSheets([updatedJob]);
+            }
+            await telegramBotInstance.sendMessage(chatId, `✅ Marked *${esc(job.title)}* at *${esc(job.company)}* as manually applied\\!`, { parse_mode: 'MarkdownV2' });
+          }
+          else if (command === '/applied') {
+            const db = await readDatabase();
+            const appliedJobs = (db.jobs || [])
+              .filter(j => j.status === 'submitted')
+              .sort((a, b) => new Date(b.timestamp || 0) - new Date(a.timestamp || 0))
+              .slice(0, 5);
+            
+            if (appliedJobs.length === 0) {
+              await telegramBotInstance.sendMessage(chatId, `❌ No applied jobs found in the database.`);
+              return;
+            }
+            
+            let appliedMsg = `🚀 *Last 5 Applied Jobs:*\n\n`;
+            for (const j of appliedJobs) {
+              appliedMsg += `• *${esc(j.title)}*\n  Company: _${esc(j.company)}_\n  Scored: *${j.score || '?'}/10* \\| Confidence: *${j.confidence || '?'}%*\n\n`;
+            }
+            await telegramBotInstance.sendMessage(chatId, appliedMsg, { parse_mode: 'MarkdownV2' });
+          } 
+          else if (command === '/run') {
+            await telegramBotInstance.sendMessage(chatId, `🚀 Full job discovery scraper cycle triggered\\.`);
+            runAutoDiscovery().catch(err => {
+              systemLog(`[Telegram /run Command] Error: ${err.message}`, 'error');
+            });
+          } 
+          else {
+            await telegramBotInstance.sendMessage(chatId, `⚠️ Unknown command\\: *${esc(command)}*\nType \`/help\` to see all commands\\.`, { parse_mode: 'MarkdownV2' });
+          }
+        } catch (cmdErr) {
+          systemLog(`[Telegram Command Error] Failed command ${command}: ${cmdErr.message}`, 'error');
+          await telegramBotInstance.sendMessage(chatId, `❌ Error executing command: ${cmdErr.message}`);
+        }
+      }
+    });
+
+    let lastPollingErrorMsg = '';
+    let lastPollingErrorTime = 0;
+
+    telegramBotInstance.on('polling_error', (error) => {
+      const errMsg = error.message || String(error);
+      const now = Date.now();
+      if (errMsg === lastPollingErrorMsg && (now - lastPollingErrorTime) < 120000) return;
+      lastPollingErrorMsg = errMsg;
+      lastPollingErrorTime = now;
+      if (errMsg.includes('ENOTFOUND') && errMsg.includes('api.telegram.org')) {
+        console.warn(`[Telegram Polling Error] Could not resolve api.telegram.org (ENOTFOUND).`);
+      } else {
+        console.error(`[Telegram Polling Error]: ${errMsg}`);
+      }
+    });
+
+    telegramBotInstance.on('error', (error) => {
+      console.error(`[Telegram Bot Error]: ${error.message}`);
+    });
+
+  } catch (err) {
+    systemLog(`[Telegram Listener] Failed to initialize: ${err.message}`, 'error');
+  }
+}
+
+async function processTelegramImportLink(bot, chatId, url) {
+  await bot.sendMessage(chatId, `⏳ *[abhii]* Scraping job details from URL:\n${url}`, { parse_mode: 'Markdown' });
+  try {
+    const scraper = getScraperModule();
+    const details = await scraper.scrapeJobUrl(url, (msg, type) => {
+      systemLog(`[Telegram Import Scraper] ${msg}`, type);
+    });
+
+    if (!details.title || !details.description) {
+      throw new Error("Could not extract title or description from job page.");
+    }
+
+    const newJob = {
+      id: 'job_' + Date.now() + '_' + Math.random().toString(36).substr(2, 5),
+      title: details.title,
+      company: details.company || 'Unknown Company',
+      url: details.url,
+      datePosted: new Date().toISOString().split('T')[0],
+      description: details.description,
+      status: 'discovered',
+      score: null,
+      scoreReason: null,
+      analysis: null,
+      tailoredResume: null,
+      coverLetter: null,
+      confidence: null,
+      submissionLogs: [],
+      timestamp: new Date().toISOString(),
+      location: details.location || ''
+    };
+
+    let exists = false;
+    await mutateDatabase(db => {
+      const duplicate = db.jobs.find(j => (url && j.url === url) || (j.title === details.title && j.company === details.company));
+      if (duplicate) {
+        exists = true;
+        return;
+      }
+      db.jobs.push(newJob);
+    });
+
+    if (exists) {
+      await bot.sendMessage(chatId, `⚠️ Job *${esc(details.title)}* at *${esc(details.company)}* is already in the database.`, { parse_mode: 'Markdown' });
+      return;
+    }
+
+    await bot.sendMessage(chatId, `✅ Imported *${esc(details.title)}* at *${esc(details.company)}*!\n\n🧠 Running ATS scoring...`, { parse_mode: 'Markdown' });
+
+    const config = await readConfig();
+    const llm = getLlmProvider();
+    const scoreResult = await llm.scoreJob(newJob, config);
+    let newStatus;
+    if (scoreResult.score >= 6) newStatus = 'scored';
+    else newStatus = 'skipped';
+
+    await mutateDatabase(db => {
+      const t = db.jobs.find(j => j.id === newJob.id);
+      if (t) {
+        t.score = scoreResult.score;
+        t.scoreReason = scoreResult.reason;
+        t.status = newStatus;
+      }
+    });
+
+    if (newStatus === 'skipped') {
+      await bot.sendMessage(chatId, `❌ *Skip (Score ${scoreResult.score}/10)*: ${esc(scoreResult.reason)}`, { parse_mode: 'Markdown' });
+      return;
+    }
+    // Removed borderline review block
+
+    await bot.sendMessage(chatId, `🚀 *Pass (Score ${scoreResult.score}/10)*: Running deep analysis, resume tailoring, and cover letter generation...`, { parse_mode: 'Markdown' });
+
+    const analysis = await llm.analyzeJob(newJob, config);
+    const tailoredResume = await llm.tailorResume(newJob, analysis, config);
+    const coverLetter = await llm.generateCoverLetter(newJob, analysis, config);
+    const coldEmail = await llm.generateColdEmail(newJob, analysis, config, newJob.poster || null);
+    const confidence = await llm.calculateConfidence(newJob, analysis, tailoredResume, coverLetter, config);
+    const finalStatus = 'ready';
+
+    await mutateDatabase(db => {
+      const t = db.jobs.find(j => j.id === newJob.id);
+      if (t) {
+        t.analysis = analysis;
+        t.tailoredResume = tailoredResume;
+        t.coverLetter = coverLetter;
+        t.coldEmail = coldEmail;
+        t.confidence = confidence;
+        t.status = finalStatus;
+      }
+    });
+
+    const finalJob = { ...newJob, analysis, tailoredResume, coverLetter, coldEmail, confidence, status: finalStatus };
+    const alertResult = await notifier.sendJobApplicationKit(finalJob, (msg, type) => systemLog(`[Telegram Import Alert] ${msg}`, type), config, true);
+
+    if (alertResult === 'sent') {
+      await mutateDatabase(db => {
+        const t = db.jobs.find(j => j.id === newJob.id);
+        if (t) t.alertSent = true;
+      });
+    }
+
+    await syncJobsToGoogleSheets([finalJob]);
+
+  } catch (err) {
+    systemLog(`Telegram link processing failed: ${err.message}`, 'error');
+    await bot.sendMessage(chatId, `❌ Failed to process URL:\n${esc(err.message)}`, { parse_mode: 'Markdown' });
+  }
+}
+
 app.listen(PORT, () => {
   systemLog(`Server running on http://localhost:${PORT}`, 'system');
   readConfig().then(config => {
@@ -1363,6 +2247,10 @@ app.listen(PORT, () => {
       await syncJobsToGoogleSheets([processedJob]);
     });
 
-        startAutoDiscoveryScheduler();
+    // Start the Telegram Link listener bot
+    initTelegramBotListener(config);
+
+    startAutoDiscoveryScheduler();
+    startDailyReportScheduler();
   }).catch(err => systemLog(`Error initializing server: ${err.message}`, 'error'));
 });

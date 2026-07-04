@@ -35,29 +35,52 @@ export default function Dashboard({ jobs, refreshJobs }) {
     scored: jobs.filter(j => j.status === 'scored').length,
     ready: jobs.filter(j => j.status === 'ready').length,
     review: jobs.filter(j => j.status === 'review').length,
+    exported: jobs.filter(j => j.status === 'exported').length,
     submitted: jobs.filter(j => j.status === 'submitted').length,
     skipped: jobs.filter(j => j.status === 'skipped').length,
   };
 
-  // Connect to SSE log stream
+  // Connect to SSE log stream with auto-reconnect
   useEffect(() => {
-    const eventSource = new EventSource('/api/logs');
-    
-    eventSource.onopen = () => {
-      setSseConnected(true);
-    };
+    let eventSource = null;
+    let reconnectTimeout = null;
+    let reconnectDelay = 1000; // start at 1s, back off up to 30s
+    let unmounted = false;
 
-    eventSource.onmessage = (event) => {
-      const data = JSON.parse(event.data);
-      setLogs((prev) => [...prev, data].slice(-200)); // Limit to last 200 logs
-    };
+    function connect() {
+      if (unmounted) return;
+      eventSource = new EventSource('/api/logs');
 
-    eventSource.onerror = () => {
-      setSseConnected(false);
-    };
+      eventSource.onopen = () => {
+        setSseConnected(true);
+        reconnectDelay = 1000; // reset backoff on success
+      };
+
+      eventSource.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          setLogs((prev) => [...prev, data].slice(-200));
+        } catch (_) {}
+      };
+
+      eventSource.onerror = () => {
+        setSseConnected(false);
+        eventSource.close();
+        if (!unmounted) {
+          reconnectTimeout = setTimeout(() => {
+            reconnectDelay = Math.min(reconnectDelay * 2, 30000); // max 30s
+            connect();
+          }, reconnectDelay);
+        }
+      };
+    }
+
+    connect();
 
     return () => {
-      eventSource.close();
+      unmounted = true;
+      if (reconnectTimeout) clearTimeout(reconnectTimeout);
+      if (eventSource) eventSource.close();
     };
   }, []);
 
@@ -265,9 +288,13 @@ export default function Dashboard({ jobs, refreshJobs }) {
           <div className="funnel-num" style={{ color: '#fbbf24' }}>{stats.review}</div>
           <div className="funnel-label">Review Queue</div>
         </div>
+        <div className="glass-card funnel-card" style={{ border: '1px solid rgba(251, 146, 60, 0.4)' }}>
+          <div className="funnel-num" style={{ color: '#fb923c' }}>{stats.exported}</div>
+          <div className="funnel-label">Exported Assets</div>
+        </div>
         <div className="glass-card funnel-card" style={{ border: '1px solid rgba(16, 185, 129, 0.4)' }}>
           <div className="funnel-num" style={{ color: '#6ee7b7' }}>{stats.submitted}</div>
-          <div className="funnel-label">Submitted</div>
+          <div className="funnel-label">Applied</div>
         </div>
       </div>
 

@@ -1,6 +1,6 @@
-// backend/nvidiaProvider.js
-// NVIDIA NIM provider — uses the OpenAI-compatible REST API via Node's built-in https.
-// Prompts are IDENTICAL to gemini.js for consistent scoring behaviour.
+// backend/openrouterProvider.js
+// OpenRouter provider — connects to the OpenRouter unified API gateway.
+// Prompts and output structures are identical to gemini.js/nvidiaProvider.js.
 
 const https = require('https');
 const path = require('path');
@@ -34,10 +34,9 @@ function httpsPost(hostname, urlPath, headers, body) {
         res.on('end', () => {
           if (res.statusCode >= 200 && res.statusCode < 300) {
             try { resolve(JSON.parse(data)); }
-            catch (e) { reject(new Error(`NIM JSON parse: ${e.message} | body: ${data.slice(0, 200)}`)); }
+            catch (e) { reject(new Error(`OpenRouter JSON parse: ${e.message} | body: ${data.slice(0, 200)}`)); }
           } else {
-            // Surface 429/503 so llmProvider.js triggers fallback
-            const err = new Error(`NVIDIA NIM HTTP ${res.statusCode}: ${data.slice(0, 300)}`);
+            const err = new Error(`OpenRouter HTTP ${res.statusCode}: ${data.slice(0, 300)}`);
             if (res.statusCode === 429 || res.statusCode === 503) {
               err.message = `429 quota: ${err.message}`;
             }
@@ -55,11 +54,10 @@ function httpsPost(hostname, urlPath, headers, body) {
 // ── Generic chat call ─────────────────────────────────────────────────────────
 async function chat(userPrompt, jsonMode = false, systemPrompt = null) {
   const cfg = readConfig();
-  const nim = cfg.nvidiaNim || {};
-  const apiKey = nim.apiKey || '';
-  const model = nim.model || 'meta/llama-3.1-8b-instruct';
+  const apiKey = cfg.openrouterApiKey || '';
+  const model = cfg.openrouterModel || 'meta-llama/llama-3-8b-instruct:free';
 
-  if (!apiKey) throw new Error('NVIDIA NIM apiKey not set in config.json');
+  if (!apiKey) throw new Error('OpenRouter openrouterApiKey not set in config.json');
 
   // When JSON mode is requested, instruct the model explicitly
   const systemMessage = systemPrompt || (jsonMode
@@ -67,9 +65,13 @@ async function chat(userPrompt, jsonMode = false, systemPrompt = null) {
     : 'You are a helpful expert assistant. Be accurate, concise, and professional.');
 
   const response = await httpsPost(
-    'integrate.api.nvidia.com',
-    '/v1/chat/completions',
-    { Authorization: `Bearer ${apiKey}` },
+    'openrouter.ai',
+    '/api/v1/chat/completions',
+    { 
+      Authorization: `Bearer ${apiKey}`,
+      'HTTP-Referer': 'https://github.com/abhay2410/job-search',
+      'X-Title': 'abhii Job Search Pilot'
+    },
     {
       model,
       messages: [
@@ -117,7 +119,7 @@ function safeParseJson(text, fallback) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Stage 2 – Job Scoring  (IDENTICAL rules to gemini.js)
+// Stage 2 – Job Scoring
 // ═══════════════════════════════════════════════════════════════════════════════
 async function scoreJob(job, config) {
   const gulfKeywords = (config.gulfLocations || [
@@ -168,7 +170,6 @@ Return ONLY valid JSON — no markdown, no explanation:
   const content = await chat(prompt, true);
   const result = safeParseJson(content, { score: 5, reason: 'Could not parse scoring response.' });
   let score = Math.max(1, Math.min(10, parseInt(result.score, 10) || 5));
-  // Apply Gulf bonus post-parse as a safety net if the model didn't apply it
   if (isGulfJob && score < 10) score = Math.min(10, score + gulfBonus);
   return {
     score,
@@ -177,7 +178,7 @@ Return ONLY valid JSON — no markdown, no explanation:
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Stage 3 – Deep Job Analysis  (IDENTICAL to gemini.js)
+// Stage 3 – Deep Job Analysis
 // ═══════════════════════════════════════════════════════════════════════════════
 async function analyzeJob(job, config) {
   const prompt = `
@@ -220,7 +221,7 @@ Return ONLY valid JSON — no markdown, no explanation:
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Stage 4 – Resume Tailoring  (IDENTICAL to gemini.js)
+// Stage 4 – Resume Tailoring
 // ═══════════════════════════════════════════════════════════════════════════════
 async function tailorResume(job, analysis, config) {
   const profile = prompts.extractProfile(config, job.title);
@@ -234,7 +235,7 @@ async function tailorResume(job, analysis, config) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Stage 5 – Cover Letter  (IDENTICAL to gemini.js)
+// Stage 5 – Cover Letter
 // ═══════════════════════════════════════════════════════════════════════════════
 async function generateCoverLetter(job, analysis, config) {
   const profile = prompts.extractProfile(config, job.title);
@@ -248,7 +249,7 @@ async function generateCoverLetter(job, analysis, config) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Stage 6 – Confidence Score  (IDENTICAL to gemini.js)
+// Stage 6 – Confidence Score
 // ═══════════════════════════════════════════════════════════════════════════════
 async function calculateConfidence(job, analysis, tailoredResume, coverLetter, config) {
   const prompt = `
@@ -282,7 +283,7 @@ Return ONLY valid JSON — no markdown, no explanation:
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Stage 5.5 – Cold Email  (IDENTICAL to gemini.js)
+// Stage 7 – Cold Email
 // ═══════════════════════════════════════════════════════════════════════════════
 async function generateColdEmail(job, analysis, config, poster) {
   const profile = prompts.extractProfile(config, job.title);
@@ -327,3 +328,4 @@ module.exports = {
   generateConnectionMessage,
   answerFormQuestion
 };
+

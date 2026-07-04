@@ -1,18 +1,23 @@
 const { GoogleGenerativeAI } = require('@google/generative-ai');
+const prompts = require('./humanization_prompts');
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-async function callGemini(prompt, apiKey, jsonMode = false, modelName = "gemini-2.5-flash") {
+async function callGemini(prompt, apiKey, jsonMode = false, modelName = "gemini-2.5-flash", systemPrompt = null) {
   let retries = 4;
   let waitTime = 16000; // Wait 16 seconds on rate limit/high demand
   
   for (let i = 0; i < retries; i++) {
     try {
       const genAI = new GoogleGenerativeAI(apiKey);
-      const model = genAI.getGenerativeModel({
+      const modelOptions = {
         model: modelName,
         generationConfig: jsonMode ? { responseMimeType: "application/json" } : undefined
-      });
+      };
+      if (systemPrompt) {
+        modelOptions.systemInstruction = systemPrompt;
+      }
+      const model = genAI.getGenerativeModel(modelOptions);
       const result = await model.generateContent(prompt);
       const text = result.response.text();
       return text;
@@ -30,6 +35,36 @@ async function callGemini(prompt, apiKey, jsonMode = false, modelName = "gemini-
       console.error('Gemini API call failed:', err);
       throw err;
     }
+  }
+}
+
+function cleanAndParseJson(text, fallback) {
+  if (!text || typeof text !== 'string') return fallback;
+  try {
+    // Strip markdown fences
+    let clean = text.replace(/```(?:json)?\s*/gi, '').replace(/```/g, '').trim();
+    // Extract the first JSON object structure
+    const match = clean.match(/\{[\s\S]*\}/);
+    if (!match) return fallback;
+    clean = match[0];
+
+    // Repair: stray unquoted word(s) AFTER a closing quote, before ]
+    // e.g.  "Adaptability to new experiences"\n   furlough],  -> "Adaptability to new experiences"],
+    clean = clean.replace(/"(\s*\n\s*)[a-zA-Z0-9_\-]+(\s*)\]/g, '"$1]');
+
+    // Repair: trailing comma before ] or }
+    clean = clean.replace(/,(\s*[\]}\)])/g, '$1');
+
+    // Repair: missing comma between consecutive quoted strings in arrays
+    clean = clean.replace(/"(\s*\n\s*)"/g, '",\n"');
+
+    return JSON.parse(clean);
+  } catch (err) {
+    try {
+      const s = text.indexOf('{'), e = text.lastIndexOf('}');
+      if (s !== -1 && e > s) return JSON.parse(text.slice(s, e + 1));
+    } catch { /* ignore */ }
+    return fallback;
   }
 }
 
@@ -85,7 +120,7 @@ Return your response in raw JSON format matching this schema:
 
   const responseText = await callGemini(prompt, config.geminiApiKey, true);
   try {
-    const parsed = JSON.parse(responseText.trim());
+    const parsed = cleanAndParseJson(responseText, { score: 5, reason: 'Failed to parse AI scoring output.' });
     let score = Math.max(1, Math.min(10, parseInt(parsed.score, 10) || 5));
     // Apply Gulf bonus post-parse as a safety net
     if (isGulfJob && score < 10) score = Math.min(10, score + gulfBonus);
@@ -134,72 +169,47 @@ Return your response in raw JSON format matching this schema:
 `;
 
   const responseText = await callGemini(prompt, config.geminiApiKey, true);
+  const fallback = {
+    requiredSkills: [],
+    preferredSkills: [],
+    tone: 'formal',
+    seniority: 'mid',
+    keywords: [],
+    redFlags: [],
+    dealBreaker: null
+  };
   try {
-    return JSON.parse(responseText.trim());
+    const result = cleanAndParseJson(responseText, fallback);
+    if (!result || !result.requiredSkills) return fallback;
+    return result;
   } catch (err) {
     console.error('Failed to parse Gemini analysis response:', responseText);
-    return {
-      requiredSkills: [],
-      preferredSkills: [],
-      tone: 'formal',
-      seniority: 'mid',
-      keywords: [],
-      redFlags: [],
-      dealBreaker: null
-    };
+    return fallback;
   }
 }
 
 // Stage 4 - Resume Tailoring
 async function tailorResume(job, analysis, config) {
-  const prompt = `
-You are an expert Resume Writer and ATS Optimizer. Rewrite the user's Master Resume specifically for this job description.
+  const profile = prompts.extractProfile(config, job.title);
+  const promptData = prompts.buildResumePrompt({
+    profile,
+    jobDescription: job.description,
+    masterResume: config.masterResume
+  });
 
-Job Title: ${job.title}
-Company: ${job.company}
-Extracted Keywords/Skills: ${JSON.stringify(analysis.keywords.concat(analysis.requiredSkills))}
-
-Master Resume:
-${config.masterResume}
-
-Strict Rules:
-1. DO NOT fabricate or hallucinate any experience, roles, companies, projects, credentials, or skills. You may only highlight, expand on, or rephrase the USER'S ACTUAL experience.
-2. Front-load the most relevant experience and accomplishments in the work history section. Reorganize bullet points within each job so the ones matching the job description appear first.
-3. Incorporate the extracted keywords and skills naturally into bullet points and summary.
-4. Keep the output clean, professional, and formatted in clear Markdown.
-5. Ensure the original details (contact info, degree, dates, company names) remain unchanged.
-
-Output ONLY the tailored resume in Markdown. Do not include any intro, outro, or explanation.
-`;
-
-  return await callGemini(prompt, config.geminiApiKey, false);
+  return await callGemini(promptData.user, config.geminiApiKey, false, "gemini-2.5-flash", promptData.system);
 }
 
 // Stage 5 - Cover Letter Generation
 async function generateCoverLetter(job, analysis, config) {
-  const prompt = `
-You are an expert Career Coach. Write a highly tailored, compelling, and concise cover letter for this job application.
+  const profile = prompts.extractProfile(config, job.title);
+  const promptData = prompts.buildCoverLetterPrompt({
+    profile,
+    jobDescription: job.description,
+    company: job.company
+  });
 
-Job Title: ${job.title}
-Company: ${job.company}
-Required Skills: ${JSON.stringify(analysis.requiredSkills)}
-Tone: ${analysis.tone}
-
-Master Resume:
-${config.masterResume}
-
-Strict Rules:
-1. The cover letter must be CONCISE and SPECIFIC (maximum 250 words).
-2. Reference the company by name, and mention 1-2 specific points about the role or company (using the description) that align with the user's experience.
-3. Match the tone: "${analysis.tone}" (startup/casual should be conversational and enthusiastic; enterprise/formal should be polished, structured, and professional).
-4. End with a clear call to action (e.g., looking forward to discussing how I can contribute).
-5. Do NOT fabricate any experience or achievements.
-6. NEVER use square brackets [] or template placeholders like [Hiring Manager], [Company Address], or [Date]. Address it to "Hiring Team" if the manager's name is unknown. Sign off as "Abhay Ramesh" based on the master resume.
-
-Output ONLY the cover letter text as a ready-to-send message. Do not include a formal heading with dates and addresses.
-`;
-
-  return await callGemini(prompt, config.geminiApiKey, false);
+  return await callGemini(promptData.user, config.geminiApiKey, false, "gemini-2.5-flash", promptData.system);
 }
 
 // Validation & Confidence Score (Stage 6 prerequisite)
@@ -234,7 +244,7 @@ Return your response in raw JSON format matching this schema:
 
   const responseText = await callGemini(prompt, config.geminiApiKey, true);
   try {
-    const result = JSON.parse(responseText.trim());
+    const result = cleanAndParseJson(responseText, { confidence: 75 });
     return result.confidence || 75;
   } catch (err) {
     console.error('Failed to parse Gemini confidence response:', responseText);
@@ -244,32 +254,35 @@ Return your response in raw JSON format matching this schema:
 
 // Stage 5.5 - Cold Email Generation
 async function generateColdEmail(job, analysis, config, poster) {
-  const prompt = `
-You are an expert Recruitment Outreach Specialist. Write a short, highly engaging cold email (maximum 150 words) from the candidate to the job poster/recruiter.
+  const profile = prompts.extractProfile(config, job.title);
+  const promptData = prompts.buildColdEmailPrompt({
+    profile,
+    jobDescription: job.description,
+    company: job.company,
+    recipientName: poster ? poster.name : null
+  });
 
-Job Title: ${job.title}
-Company: ${job.company}
-Hiring Team Member: ${poster ? JSON.stringify(poster) : 'Unknown'}
-Job Description Requirements: ${JSON.stringify(analysis.requiredSkills)}
+  return await callGemini(promptData.user, config.geminiApiKey, false, "gemini-2.5-flash", promptData.system);
+}
 
-Candidate Resume Summary:
-${config.masterResume}
+async function generateConnectionMessage(job, analysis, config, poster) {
+  const profile = prompts.extractProfile(config, job.title);
+  const promptData = prompts.buildLinkedInNotePrompt({
+    profile,
+    recipientName: poster ? poster.name : null,
+    company: job.company
+  });
 
-Strict Rules:
-1. Address the recipient by name if available (e.g. "Dear ${poster && poster.name ? poster.name.split(' ')[0] : 'Hiring Manager'}"), else use a friendly professional greeting like "Dear Hiring Team" or "Dear Recruitment Manager".
-2. Write a highly tailored pitch:
-   - Identify that you recently saw the opening for "${job.title}".
-   - In 2-3 sentences, pitch why your specific background (B.Tech EEE, Embedded Systems/Firmware experience, and key projects like FaceID Access System or Electric Vehicle controls) is an exact match for the requirements.
-   - Reference the company name naturally.
-3. The email must be extremely concise, punchy, and professional (under 150 words).
-4. Do NOT include generic template placeholders (like [Date], [Insert Link], [My Phone]). Use the candidate's real details:
-   - Name: Abhay Ramesh
-   - Email: abhayramesh000@gmail.com
-   - Phone: +91 9961612078
-5. Output ONLY the cold email text. No other text, introduction, or markdown block.
-`;
+  return (await callGemini(promptData.user, config.geminiApiKey, false, "gemini-2.5-flash", promptData.system)).trim().substring(0, 300);
+}
 
-  return await callGemini(prompt, config.geminiApiKey, false);
+/**
+ * Answer a single application form question using the candidate's resume.
+ * Delegates to formAnswerer which handles caching, fast-path, and LLM fallback.
+ */
+async function answerFormQuestion(label, type, options, job, config) {
+  const formAnswerer = require('./formAnswerer');
+  return formAnswerer.answerQuestion({ label, type, options, job, config });
 }
 
 module.exports = {
@@ -278,5 +291,7 @@ module.exports = {
   tailorResume,
   generateCoverLetter,
   calculateConfidence,
-  generateColdEmail
+  generateColdEmail,
+  generateConnectionMessage,
+  answerFormQuestion
 };

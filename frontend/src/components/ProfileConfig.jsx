@@ -11,6 +11,7 @@ export default function ProfileConfig() {
     workAuthorization: '',
     geminiApiKey: '',
     googleSheetsUrl: '',
+    emailEnabled: true,
     smtpHost: '',
     smtpPort: 587,
     smtpSecure: false,
@@ -18,12 +19,19 @@ export default function ProfileConfig() {
     smtpPass: '',
     hunterApiKey: '',
     senderEmail: '',
+    notifyEmail: '',
     useLocalChromeProfile: false,
     chromeProfileName: 'Default',
     autoApplyEnabled: true,
     maxJobsAppliedPerRun: 5,
-    discordWebhookUrl: '',
-    enableEmailAlerts: false
+    telegramBotToken: '',
+    telegramChatId: '',
+    linkedinOutreachEnabled: true,
+    linkedinMaxConnectionsPerDay: 30,
+    openrouterApiKey: '',
+    openrouterModel: 'meta-llama/llama-3-8b-instruct:free',
+    apifyEnabled: false,
+    apifyApiToken: ''
   });
 
   const [rolesStr, setRolesStr] = useState('');
@@ -47,8 +55,15 @@ export default function ProfileConfig() {
           chromeProfileName: data.chromeProfileName || 'Default',
           autoApplyEnabled: data.autoApplyEnabled !== false,
           maxJobsAppliedPerRun: data.maxJobsAppliedPerRun || 5,
-          discordWebhookUrl: data.discordWebhookUrl || '',
-          enableEmailAlerts: data.enableEmailAlerts || false
+          telegramBotToken: data.telegramBotToken || '',
+          telegramChatId: data.telegramChatId || '',
+          emailEnabled: data.emailEnabled !== false,
+          linkedinOutreachEnabled: data.linkedinOutreachEnabled !== false,
+          linkedinMaxConnectionsPerDay: data.linkedinMaxConnectionsPerDay || 30,
+          openrouterApiKey: data.openrouterApiKey || '',
+          openrouterModel: data.openrouterModel || 'meta-llama/llama-3-8b-instruct:free',
+          apifyEnabled: data.apifyEnabled || false,
+          apifyApiToken: data.apifyApiToken || ''
         }));
         setRolesStr((data.targetRoles || []).join(', '));
         setLocationsStr((data.locations || []).join(', '));
@@ -95,13 +110,21 @@ export default function ProfileConfig() {
       salaryFloor: config.salaryFloor ? Number(config.salaryFloor) : null,
       smtpPort: config.smtpPort ? Number(config.smtpPort) : 587,
       smtpSecure: Boolean(config.smtpSecure),
+      emailEnabled: config.emailEnabled !== false,
       useLocalChromeProfile: Boolean(config.useLocalChromeProfile),
       chromeProfileName: config.chromeProfileName || 'Default',
       autoApplyEnabled: Boolean(config.autoApplyEnabled),
       maxJobsAppliedPerRun: config.maxJobsAppliedPerRun ? Number(config.maxJobsAppliedPerRun) : 5,
-      discordWebhookUrl: config.discordWebhookUrl || '',
-      enableEmailAlerts: Boolean(config.enableEmailAlerts),
-      hunterApiKey: config.hunterApiKey || ''
+      telegramBotToken: config.telegramBotToken || '',
+      telegramChatId: config.telegramChatId || '',
+      hunterApiKey: config.hunterApiKey || '',
+      notifyEmail: config.notifyEmail || '',
+      linkedinOutreachEnabled: Boolean(config.linkedinOutreachEnabled),
+      linkedinMaxConnectionsPerDay: config.linkedinMaxConnectionsPerDay ? Number(config.linkedinMaxConnectionsPerDay) : 30,
+      openrouterApiKey: config.openrouterApiKey || '',
+      openrouterModel: config.openrouterModel || 'meta-llama/llama-3-8b-instruct:free',
+      apifyEnabled: Boolean(config.apifyEnabled),
+      apifyApiToken: config.apifyApiToken || ''
     };
 
     fetch('/api/config', {
@@ -161,6 +184,29 @@ export default function ProfileConfig() {
               value={config.googleSheetsUrl || ''}
               onChange={e => setConfig({ ...config, googleSheetsUrl: e.target.value })}
               placeholder="https://script.google.com/macros/s/.../exec"
+            />
+          </div>
+        </div>
+
+        <div className="form-row">
+          <div className="form-group">
+            <label htmlFor="openrouterApiKey">OpenRouter API Key (Optional)</label>
+            <input
+              type="password"
+              id="openrouterApiKey"
+              value={config.openrouterApiKey || ''}
+              onChange={e => setConfig({ ...config, openrouterApiKey: e.target.value })}
+              placeholder="sk-or-v1-..."
+            />
+          </div>
+          <div className="form-group">
+            <label htmlFor="openrouterModel">OpenRouter Model</label>
+            <input
+              type="text"
+              id="openrouterModel"
+              value={config.openrouterModel || 'meta-llama/llama-3-8b-instruct:free'}
+              onChange={e => setConfig({ ...config, openrouterModel: e.target.value })}
+              placeholder="meta-llama/llama-3-8b-instruct:free"
             />
           </div>
         </div>
@@ -240,6 +286,20 @@ export default function ProfileConfig() {
         <h3 style={{ marginTop: '2rem', marginBottom: '1rem', color: '#a5b4fc', borderBottom: '1px solid rgba(255,255,255,0.08)', paddingBottom: '0.25rem' }}>
           Cold Email SMTP Server Setup
         </h3>
+        
+        <div className="form-group" style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '1.25rem', marginTop: '0.5rem' }}>
+          <input
+            type="checkbox"
+            id="emailEnabled"
+            checked={config.emailEnabled !== false}
+            onChange={e => setConfig({ ...config, emailEnabled: e.target.checked })}
+            style={{ width: '18px', height: '18px', margin: 0 }}
+          />
+          <label htmlFor="emailEnabled" style={{ margin: 0, cursor: 'pointer' }}>
+            📧 Enable email notifications (Sends job application kits via SMTP)
+          </label>
+        </div>
+
         <p style={{ fontSize: '0.85rem', color: 'var(--text-muted)', marginBottom: '1.25rem' }}>
           Configure your personal outgoing mail server to send cold outreach recruiter emails directly. For Gmail, use host <code>smtp.gmail.com</code>, port <code>587</code> (TLS), and generate a 16-character App Password under Google Account Security.
         </p>
@@ -311,6 +371,19 @@ export default function ProfileConfig() {
               placeholder="your-name@gmail.com (must match authorized sender)"
             />
           </div>
+          <div className="form-group">
+            <label htmlFor="notifyEmail">📬 Job Alert Recipient Email</label>
+            <input
+              type="email"
+              id="notifyEmail"
+              value={config.notifyEmail || ''}
+              onChange={e => setConfig({ ...config, notifyEmail: e.target.value })}
+              placeholder="same as sender, or your personal Gmail"
+            />
+            <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginTop: '0.25rem', display: 'block' }}>
+              Every new job alert (cover letter, resume, cold email) will be emailed here. Defaults to sender email if blank.
+            </span>
+          </div>
         </div>
 
         <h3 style={{ marginTop: '2rem', marginBottom: '1rem', color: '#34d399', borderBottom: '1px solid rgba(255,255,255,0.08)', paddingBottom: '0.25rem' }}>
@@ -333,6 +406,38 @@ export default function ProfileConfig() {
             <span style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginTop: '0.25rem', display: 'block' }}>
               Pipeline will automatically query Hunter.io for real recruiter emails after finding each company's career page.
             </span>
+          </div>
+        </div>
+
+        <h3 style={{ marginTop: '2rem', marginBottom: '1rem', color: '#fbbf24', borderBottom: '1px solid rgba(255,255,255,0.08)', paddingBottom: '0.25rem' }}>
+          ⚡ Apify Scraper & Profile Email Extractor (Recommended)
+        </h3>
+        <p style={{ fontSize: '0.85rem', color: 'var(--text-muted)', marginBottom: '1.25rem' }}>
+          Bypass local browser blocks by running job searches and recruiter profile email scrapers in the cloud using Apify.
+          Get a free token by signing up at <a href="https://apify.com" target="_blank" rel="noreferrer" style={{ color: '#fbbf24' }}>apify.com →</a>
+        </p>
+        <div className="form-group" style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginBottom: '1.25rem', marginTop: '0.5rem' }}>
+          <input
+            type="checkbox"
+            id="apifyEnabled"
+            checked={!!config.apifyEnabled}
+            onChange={e => setConfig({ ...config, apifyEnabled: e.target.checked })}
+            style={{ width: '18px', height: '18px', margin: 0 }}
+          />
+          <label htmlFor="apifyEnabled" style={{ margin: 0, cursor: 'pointer' }}>
+            Enable Apify Cloud Services (Job Discovery Scrapers & LinkedIn Profile Email Scraper)
+          </label>
+        </div>
+        <div className="form-row">
+          <div className="form-group">
+            <label htmlFor="apifyApiToken">Apify API Token</label>
+            <input
+              type="password"
+              id="apifyApiToken"
+              value={config.apifyApiToken || ''}
+              onChange={e => setConfig({ ...config, apifyApiToken: e.target.value })}
+              placeholder="apify_api_..."
+            />
           </div>
         </div>
 
@@ -369,35 +474,63 @@ export default function ProfileConfig() {
         </div>
 
         <h3 style={{ marginTop: '2rem', marginBottom: '1rem', color: '#a5b4fc', borderBottom: '1px solid rgba(255,255,255,0.08)', paddingBottom: '0.25rem' }}>
-          📱 Notification Alerts (Discord & Email)
+          📱 Telegram Notification Settings (Fallback)
         </h3>
         <p style={{ fontSize: '0.85rem', color: 'var(--text-muted)', marginBottom: '1.25rem' }}>
-          Get instant alerts when a job matches or requires manual review. Email alerts will use the SMTP settings configured above and will automatically attach the generated PDF Cover Letter and Resume.
+          Create a bot via BotFather on Telegram. If configured, you will receive application materials (Links, Cover Letters, Resumes) directly on Telegram whenever an automated application pauses and requires manual review.
         </p>
         <div className="form-row">
           <div className="form-group">
-            <label htmlFor="discordWebhookUrl">Discord Webhook URL</label>
+            <label htmlFor="telegramBotToken">Telegram Bot Token</label>
             <input
               type="password"
-              id="discordWebhookUrl"
-              value={config.discordWebhookUrl || ''}
-              onChange={e => setConfig({ ...config, discordWebhookUrl: e.target.value })}
-              placeholder="https://discord.com/api/webhooks/..."
+              id="telegramBotToken"
+              value={config.telegramBotToken || ''}
+              onChange={e => setConfig({ ...config, telegramBotToken: e.target.value })}
+              placeholder="1234567890:AAH..."
+            />
+          </div>
+          <div className="form-group">
+            <label htmlFor="telegramChatId">Telegram Chat ID</label>
+            <input
+              type="text"
+              id="telegramChatId"
+              value={config.telegramChatId || ''}
+              onChange={e => setConfig({ ...config, telegramChatId: e.target.value })}
+              placeholder="123456789"
             />
           </div>
         </div>
+
+        <h3 style={{ marginTop: '2rem', marginBottom: '1rem', color: '#a5b4fc', borderBottom: '1px solid rgba(255,255,255,0.08)', paddingBottom: '0.25rem' }}>
+          🤝 LinkedIn Auto-Outreach Settings
+        </h3>
+        <p style={{ fontSize: '0.85rem', color: 'var(--text-muted)', marginBottom: '1.25rem' }}>
+          Automatically send personalized connection requests or direct messages (DMs) to the job poster or recruiter of jobs that pass scoring and analysis.
+        </p>
         <div className="form-row">
-          <div className="form-group" style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginTop: '0.5rem' }}>
+          <div className="form-group" style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', marginTop: '0.5rem', marginBottom: '0.5rem' }}>
             <input
               type="checkbox"
-              id="enableEmailAlerts"
-              checked={!!config.enableEmailAlerts}
-              onChange={e => setConfig({ ...config, enableEmailAlerts: e.target.checked })}
-              style={{ width: '18px', height: '18px', margin: 0 }}
+              id="linkedinOutreachEnabled"
+              checked={!!config.linkedinOutreachEnabled}
+              onChange={e => setConfig({ ...config, linkedinOutreachEnabled: e.target.checked })}
+              style={{ width: '18px', height: '18px', margin: 0, cursor: 'pointer' }}
             />
-            <label htmlFor="enableEmailAlerts" style={{ margin: 0 }}>
-              📧 Enable Email Alerts (Sends to {config.senderEmail || 'your SMTP Sender Email'})
+            <label htmlFor="linkedinOutreachEnabled" style={{ margin: 0, cursor: 'pointer' }}>
+              Enable LinkedIn connection requests & DMs
             </label>
+          </div>
+          <div className="form-group" style={{ maxWidth: '180px' }}>
+            <label htmlFor="linkedinMaxConnectionsPerDay">Max Connections/day</label>
+            <input
+              type="number"
+              id="linkedinMaxConnectionsPerDay"
+              min="1"
+              max="50"
+              value={config.linkedinMaxConnectionsPerDay || 30}
+              onChange={e => setConfig({ ...config, linkedinMaxConnectionsPerDay: e.target.value })}
+            />
           </div>
         </div>
 

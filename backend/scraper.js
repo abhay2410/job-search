@@ -2,6 +2,7 @@ const { chromium } = require('playwright');
 const fs = require('fs');
 const path = require('path');
 const { findHrDetails } = require('./hr_finder');
+const { ApifyClient } = require('apify-client');
 
 // Helper for human-like delay
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -17,22 +18,26 @@ function getRandomUserAgent() {
 }
 
 // Scrape single URL
-async function scrapeJobUrl(url, logFn) {
+async function scrapeJobUrl(url, logFn, configInput = null) {
+  if (!url || typeof url !== 'string' || url.trim() === '') {
+    throw new Error('Cannot navigate to invalid or empty URL.');
+  }
+  let config = configInput;
+  if (!config) {
+    try {
+      const configPath = path.join(__dirname, '..', 'config.json');
+      if (fs.existsSync(configPath)) {
+        config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+      }
+    } catch (e) {
+      // ignore
+    }
+  }
+
   const userAgent = getRandomUserAgent();
   logFn(`Launching browser for single URL scrape (User-Agent: ...${userAgent.slice(-20)})...`, 'info');
 
-  const browser = await chromium.launch({
-    headless: true,
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-gpu',
-      '--no-zygote',
-      '--disable-features=VizDisplayCompositor',
-      '--disable-http2'
-    ]
-  });
+  const browser = await launchScraperBrowser(config);
   const context = await browser.newContext({ userAgent, locale: 'en-US' });
 
   const page = await context.newPage();
@@ -87,6 +92,14 @@ async function scrapeJobUrl(url, logFn) {
       posterName = await page.locator('.message-the-poster__name, .hiring-team-card__name, .hiring-manager__name, .hiring-team__name, .message-the-poster__profile-link').first().innerText().catch(() => '');
       posterTitle = await page.locator('.message-the-poster__headline, .message-the-poster__title, .hiring-team-card__headline, .hiring-manager__headline, .hiring-team__headline').first().innerText().catch(() => '');
       posterUrl = await page.locator('a.message-the-poster__profile-link, a.hiring-team-card__link, a.hiring-team__profile-link, a.hiring-manager__profile-link').first().getAttribute('href').catch(() => '');
+    } else if (lowerUrl.includes('indeed.com')) {
+      title = await page.locator('h1.jobsearch-JobInfoHeader-title, h1').first().innerText().catch(() => '');
+      company = await page.locator('[data-testid="inlineHeader-companyName"] a, .jobsearch-CompanyReview--heading a, span[data-testid="company-name"]').first().innerText().catch(() => '');
+      description = await page.locator('#jobDescriptionText').first().innerText().catch(() => '');
+    } else if (lowerUrl.includes('gulftalent.com')) {
+      title = await page.locator('h1').first().innerText().catch(() => '');
+      company = await page.locator('.company-name, a[href*="/companies/"]').first().innerText().catch(() => '');
+      description = await page.locator('.job-description, .description').first().innerText().catch(() => '');
     }
 
     // Fallback parser for generic sites
@@ -160,11 +173,9 @@ async function scrapeJobUrl(url, logFn) {
   }
 }
 
-// Bulk discovery using LinkedIn Job Search directly
-async function scrapeJobs(keyword, location, config, logFn) {
-  logFn(`Starting job discovery for Keyword: "${keyword}", Location: "${location}"...`, 'info');
-
-  const browser = await chromium.launch({
+// Browser launcher helper
+async function launchScraperBrowser(config) {
+  const launchOptions = {
     headless: true,
     args: [
       '--no-sandbox',
@@ -173,9 +184,278 @@ async function scrapeJobs(keyword, location, config, logFn) {
       '--disable-gpu',
       '--no-zygote',
       '--disable-features=VizDisplayCompositor',
-      '--disable-http2'
+      '--disable-http2',
+      '--disable-blink-features=AutomationControlled'
     ]
+  };
+
+  if (config && config.chromeExePath) {
+    launchOptions.executablePath = config.chromeExePath;
+  }
+
+  const browser = await chromium.launch(launchOptions);
+  return browser;
+}
+
+// LinkedIn Discovery Scraper
+async function scrapeLinkedInJobs(page, keyword, location, logFn) {
+  const searchUrl = `https://www.linkedin.com/jobs/search/?keywords=${encodeURIComponent(keyword)}&location=${encodeURIComponent(location)}`;
+  logFn(`[LinkedIn] Navigating directly to: ${searchUrl}`, 'info');
+  
+  await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+  await page.waitForTimeout(3000); // Wait for the cards to render
+
+  const rawJobs = await page.evaluate(() => {
+    const cards = Array.from(document.querySelectorAll('.base-card, .job-search-card, .base-search-card, .job-card-container, .jobs-search-results__list-item'));
+    return cards.map(card => {
+      const titleEl = card.querySelector('.base-search-card__title, .job-search-card__title, .job-card-list__title, .artdeco-entity-lockup__title');
+      const companyEl = card.querySelector('.base-search-card__subtitle, .job-search-card__subtitle, .job-search-card__company-name, .job-card-container__company-name, .artdeco-entity-lockup__subtitle');
+      const linkEl = card.querySelector('a.base-card__full-link, a.job-search-card__link, a.job-card-container__link, a.job-card-list__title');
+      const locationEl = card.querySelector('.job-search-card__location, .base-search-card__metadata, .job-card-container__metadata-item');
+      
+      return {
+        title: titleEl ? titleEl.innerText.trim() : '',
+        company: companyEl ? companyEl.innerText.trim() : '',
+        url: linkEl ? linkEl.href : '',
+        location: locationEl ? locationEl.innerText.trim().replace(/\n/g, ' ') : ''
+      };
+    }).filter(j => j.url && j.title);
   });
+
+  logFn(`[LinkedIn] Found ${rawJobs.length} potential job listings.`, 'info');
+  return rawJobs;
+}
+
+// Indeed UAE Discovery Scraper
+async function scrapeIndeedJobs(page, keyword, location, logFn) {
+  // Use ae.indeed.com for UAE
+  const searchUrl = `https://ae.indeed.com/jobs?q=${encodeURIComponent(keyword)}&l=${encodeURIComponent(location)}`;
+  logFn(`[Indeed UAE] Navigating directly to: ${searchUrl}`, 'info');
+  
+  await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+  await page.waitForTimeout(3000); // Wait for the cards to render
+
+  const rawJobs = await page.evaluate(() => {
+    const cards = Array.from(document.querySelectorAll('.job_seen_beacon, .result'));
+    return cards.map(card => {
+      const titleEl = card.querySelector('.jcs-JobTitle span, h3.jobTitle a span');
+      const companyEl = card.querySelector('[data-testid="company-name"]');
+      const linkEl = card.querySelector('a.jcs-JobTitle, h3.jobTitle a');
+      const locationEl = card.querySelector('[data-testid="text-location"]');
+      
+      const jk = linkEl ? linkEl.getAttribute('data-jk') || linkEl.id.replace('job_', '') : '';
+      const url = jk ? `https://ae.indeed.com/viewjob?jk=${jk}` : (linkEl ? linkEl.href : '');
+      
+      return {
+        title: titleEl ? titleEl.innerText.trim() : '',
+        company: companyEl ? companyEl.innerText.trim() : '',
+        url: url,
+        location: locationEl ? locationEl.innerText.trim() : ''
+      };
+    }).filter(j => j.url && j.title);
+  });
+
+  logFn(`[Indeed UAE] Found ${rawJobs.length} potential job listings.`, 'info');
+  return rawJobs;
+}
+
+// GulfTalent Discovery Scraper
+async function scrapeGulfTalentJobs(page, keyword, location, logFn) {
+  const searchUrl = `https://www.gulftalent.com/jobs/search?key=${encodeURIComponent(keyword)}`;
+  logFn(`[GulfTalent] Navigating directly to: ${searchUrl}`, 'info');
+  
+  await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+  await page.waitForTimeout(3000); // Wait for the cards to render
+
+  const rawJobs = await page.evaluate(() => {
+    const cards = Array.from(document.querySelectorAll('tr[data-cy="job-result-row"]'));
+    return cards.map(card => {
+      const titleEl = card.querySelector('a[data-cy="job-link"]');
+      const companyEl = card.querySelector('a[href*="/companies/"]');
+      let locationText = '';
+      
+      const locationEl = card.querySelector('a[href*="/jobs/city/"], a[href*="/jobs/country/"], a[href*="/jobs/"]');
+      if (locationEl && locationEl !== titleEl && locationEl !== companyEl) {
+        locationText = locationEl.innerText.trim();
+      } else {
+        // Fallback parsing of row text: "Title \n Company \t Location \t Date"
+        const parts = (card.innerText || '').split('\n');
+        if (parts.length > 1) {
+          const subParts = parts[1].split('\t');
+          if (subParts.length > 1) {
+            locationText = subParts[1].trim();
+          }
+        }
+      }
+      
+      let jobUrl = titleEl ? titleEl.getAttribute('href') || '' : '';
+      if (jobUrl && !jobUrl.startsWith('http')) {
+        jobUrl = 'https://www.gulftalent.com' + jobUrl;
+      }
+      
+      return {
+        title: titleEl ? titleEl.innerText.trim() : '',
+        company: companyEl ? companyEl.innerText.trim() : '',
+        url: jobUrl,
+        location: locationText
+      };
+    }).filter(j => j.url && j.title);
+  });
+
+  logFn(`[GulfTalent] Found ${rawJobs.length} potential job listings.`, 'info');
+  return rawJobs;
+}
+
+// Google Jobs Discovery Scraper
+async function scrapeGoogleJobs(page, keyword, location, logFn) {
+  // Query with ibp=htl;jobs (encoded as %3B) for immersive view
+  const searchUrl = `https://www.google.com/search?q=${encodeURIComponent(keyword + ' ' + location)}&ibp=htl%3Bjobs&hl=en&gl=ae`;
+  logFn(`[Google Jobs] Navigating directly to: ${searchUrl}`, 'info');
+  
+  await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+  await page.waitForTimeout(5000); // Wait for the cards to render
+
+  // Step 1: Extract card-level data (title, company, location) from the job list
+  const cardData = await page.evaluate(() => {
+    const cards = Array.from(document.querySelectorAll('span.gmxZue'));
+    return cards.map((card, index) => {
+      const titleEl = card.querySelector('.tNxQIb');
+      const companyEl = card.querySelector('.wHYlTd.MKCbgd.a3jPc');
+      const locationEl = card.querySelector('.wHYlTd.FqK3wc.MKCbgd');
+      return {
+        index,
+        title: titleEl ? titleEl.innerText.trim() : '',
+        company: companyEl ? companyEl.innerText.trim() : '',
+        location: locationEl ? locationEl.innerText.trim() : ''
+      };
+    }).filter(c => c.title);
+  });
+
+  logFn(`[Google Jobs] Found ${cardData.length} card entries. Clicking each to extract apply links...`, 'info');
+
+  // Step 2: Click each card and extract the first apply link from the detail panel
+  const rawJobs = [];
+  const cardElements = page.locator('span.gmxZue');
+  const cardCount = Math.min(await cardElements.count(), 10); // Cap at 10 cards
+  let previousApplyLink = '';
+
+  for (let i = 0; i < cardCount; i++) {
+    try {
+      await cardElements.nth(i).click({ timeout: 3000 });
+
+      // Wait for the detail panel's apply link to change from the previous card
+      let applyLink = '';
+      for (let attempt = 0; attempt < 6; attempt++) {
+        await page.waitForTimeout(500);
+        applyLink = await page.evaluate(() => {
+          const link = document.querySelector('a.brKmxb');
+          return link ? link.href : '';
+        });
+        if (applyLink && applyLink !== previousApplyLink) break;
+      }
+
+      if (applyLink && applyLink !== previousApplyLink && cardData[i]) {
+        rawJobs.push({
+          title: cardData[i].title,
+          company: cardData[i].company,
+          url: applyLink,
+          location: cardData[i].location
+        });
+        previousApplyLink = applyLink;
+      }
+    } catch (err) {
+      // Skip cards that fail to click
+    }
+  }
+
+  logFn(`[Google Jobs] Found ${rawJobs.length} potential job listings with apply links.`, 'info');
+  return rawJobs;
+}
+
+// Helper for Apify LinkedIn scraper
+async function scrapeLinkedInJobsApify(client, keyword, location, logFn) {
+  logFn(`[Apify LinkedIn] Starting cloud LinkedIn job scrape for "${keyword}" in "${location}"...`, 'info');
+  try {
+    const searchUrl = `https://www.linkedin.com/jobs/search/?keywords=${encodeURIComponent(keyword)}&location=${encodeURIComponent(location)}`;
+    const run = await client.actor('curious_coder/linkedin-jobs-scraper').call({
+      urls: [searchUrl],
+      limit: 15,
+      proxyConfiguration: { useApifyProxy: true }
+    });
+    const { items } = await client.dataset(run.defaultDatasetId).listItems();
+    logFn(`[Apify LinkedIn] Retrieved ${items.length} job listings from cloud dataset.`, 'success');
+    return items.map(item => ({
+      title: item.title || '',
+      company: item.companyName || item.company?.name || 'Unknown Company',
+      url: item.jobUrl || item.url || '',
+      location: item.location || '',
+      description: item.description || ''
+    }));
+  } catch (err) {
+    logFn(`[Apify LinkedIn] Cloud scraping failed: ${err.message}`, 'warning');
+    return [];
+  }
+}
+
+// Helper for Apify Indeed scraper
+async function scrapeIndeedJobsApify(client, keyword, location, logFn) {
+  logFn(`[Apify Indeed] Starting cloud Indeed job scrape for "${keyword}" in "${location}"...`, 'info');
+  try {
+    let countryCode = 'AE';
+    const loc = location.toLowerCase();
+    if (loc.includes('saudi') || loc.includes('riyadh') || loc.includes('jeddah') || loc.includes('ksa')) countryCode = 'SA';
+    else if (loc.includes('qatar') || loc.includes('doha')) countryCode = 'QA';
+    else if (loc.includes('oman') || loc.includes('muscat')) countryCode = 'OM';
+    else if (loc.includes('bahrain') || loc.includes('manama')) countryCode = 'BH';
+    else if (loc.includes('kuwait')) countryCode = 'KW';
+
+    const run = await client.actor('misceres/indeed-scraper').call({
+      position: keyword,
+      location: location,
+      country: countryCode,
+      maxItems: 15,
+      proxyConfiguration: { useApifyProxy: true }
+    });
+    const { items } = await client.dataset(run.defaultDatasetId).listItems();
+    logFn(`[Apify Indeed] Retrieved ${items.length} job listings from cloud dataset.`, 'success');
+    return items.map(item => ({
+      title: item.positionName || item.title || '',
+      company: item.company || 'Unknown Company',
+      url: item.url || '',
+      location: item.location || '',
+      description: item.description || ''
+    }));
+  } catch (err) {
+    logFn(`[Apify Indeed] Cloud Indeed scraping failed: ${err.message}`, 'warning');
+    return [];
+  }
+}
+
+// Unified Bulk discovery using multiple Job search engines
+async function scrapeJobs(keyword, location, config, logFn, existingUrlsInput = null, activeSource = null) {
+  const srcLabel = activeSource ? activeSource.toUpperCase() : 'ALL';
+  logFn(`Starting multi-source job discovery [Source: ${srcLabel}] for Keyword: "${keyword}", Location: "${location}"...`, 'info');
+
+  let apifyJobs = [];
+  let useApify = config.apifyEnabled && (config.apifyApiToken || process.env.APIFY_API_TOKEN);
+
+  if (useApify) {
+    logFn(`Apify cloud scraping is enabled. Running LinkedIn and Indeed searches in the cloud...`, 'info');
+    try {
+      const client = new ApifyClient({ token: config.apifyApiToken || process.env.APIFY_API_TOKEN });
+      const [liJobs, indJobs] = await Promise.all([
+        scrapeLinkedInJobsApify(client, keyword, location, logFn),
+        scrapeIndeedJobsApify(client, keyword, location, logFn)
+      ]);
+      apifyJobs = [...liJobs, ...indJobs];
+      logFn(`Apify cloud scraper returned ${apifyJobs.length} total jobs.`, 'success');
+    } catch (err) {
+      logFn(`Apify cloud scraper encountered an error: ${err.message}. Falling back to local scraping...`, 'warning');
+      useApify = false;
+    }
+  }
+
+  const browser = await launchScraperBrowser(config);
   const context = await browser.newContext({
     userAgent: getRandomUserAgent(),
     locale: 'en-US'
@@ -183,69 +463,105 @@ async function scrapeJobs(keyword, location, config, logFn) {
 
   const page = await context.newPage();
 
+  // Block non-essential assets like images, fonts, and media
+  await page.route('**/*', (route) => {
+    const type = route.request().resourceType();
+    if (['image', 'media', 'font'].includes(type)) {
+      route.abort();
+    } else {
+      route.continue();
+    }
+  });
+
   const results = [];
 
   try {
-    // Read existing database to avoid scraping jobs we already have
-    let existingUrls = new Set();
-    try {
-      const dbPath = path.join(__dirname, '..', 'database.json');
-      if (fs.existsSync(dbPath)) {
-        const dbData = JSON.parse(fs.readFileSync(dbPath, 'utf8'));
-        if (dbData.jobs && Array.isArray(dbData.jobs)) {
-          dbData.jobs.forEach(j => {
-            if (j.url) existingUrls.add(j.url.toLowerCase().trim());
-          });
-        }
-      }
-    } catch (e) {
-      logFn(`Could not read database.json for deduplication: ${e.message}`, 'warning');
-    }
-
-    const searchUrl = `https://www.linkedin.com/jobs/search/?keywords=${encodeURIComponent(keyword)}&location=${encodeURIComponent(location)}`;
-    logFn(`Navigating directly to LinkedIn Job Search: ${searchUrl}`, 'info');
-    
-    await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    await page.waitForTimeout(3000); // Wait for the cards to render
-
-    const rawJobs = await page.evaluate(() => {
-      const cards = Array.from(document.querySelectorAll('.base-card, .job-search-card, .base-search-card, .job-card-container, .jobs-search-results__list-item'));
-      return cards.map(card => {
-        const titleEl = card.querySelector('.base-search-card__title, .job-search-card__title, .job-card-list__title, .artdeco-entity-lockup__title');
-        const companyEl = card.querySelector('.base-search-card__subtitle, .job-search-card__subtitle, .job-search-card__company-name, .job-card-container__company-name, .artdeco-entity-lockup__subtitle');
-        const linkEl = card.querySelector('a.base-card__full-link, a.job-search-card__link, a.job-card-container__link, a.job-card-list__title');
-        const locationEl = card.querySelector('.job-search-card__location, .base-search-card__metadata, .job-card-container__metadata-item');
-        
-        return {
-          title: titleEl ? titleEl.innerText.trim() : '',
-          company: companyEl ? companyEl.innerText.trim() : '',
-          url: linkEl ? linkEl.href : '',
-          location: locationEl ? locationEl.innerText.trim().replace(/\n/g, ' ') : ''
-        };
-      }).filter(j => j.url && j.title);
-    });
-
-    logFn(`LinkedIn search returned ${rawJobs.length} potential job listings.`, 'info');
-
-    if (rawJobs.length === 0) {
-      logFn('No job cards found on LinkedIn. This could be due to rate-limiting or selector changes.', 'warning');
+    // Read existing database to avoid scraping duplicate URLs
+    let existingUrls = existingUrlsInput || new Set();
+    if (!existingUrlsInput) {
       try {
-        await page.screenshot({ path: path.join(__dirname, '..', 'scratch', 'linkedin_error.jpg') });
-        logFn('Saved screenshot to scratch/linkedin_error.jpg for debugging.', 'info');
-      } catch (e) {}
-      return [];
+        const sqliteDb = require('./db');
+        const jobs = sqliteDb.getAllJobs();
+        jobs.forEach(j => {
+          if (j.url) existingUrls.add(j.url.toLowerCase().trim());
+        });
+      } catch (e) {
+        logFn(`Could not read SQLite database for deduplication: ${e.message}`, 'warning');
+      }
     }
 
-    // Filter jobs (blacklist & duplicates)
+    // 1. Crawl active source only (round-robin rotation)
+    let allRawJobs = [];
+    const src = activeSource || 'all';
+
+    // Source A: LinkedIn (local Playwright)
+    if (src === 'linkedin' || src === 'all') {
+      try {
+        const linkedinJobs = await scrapeLinkedInJobs(page, keyword, location, logFn);
+        allRawJobs = allRawJobs.concat(linkedinJobs);
+      } catch (err) {
+        logFn(`LinkedIn local scraping failed: ${err.message}`, 'warning');
+      }
+    }
+
+    // Source B: Indeed (local Playwright)
+    if (src === 'indeed' || src === 'all') {
+      try {
+        const indeedJobs = await scrapeIndeedJobs(page, keyword, location, logFn);
+        allRawJobs = allRawJobs.concat(indeedJobs);
+      } catch (err) {
+        logFn(`Indeed local scraping failed: ${err.message}`, 'warning');
+      }
+    }
+
+    // Apify cloud boost: appended on top of LinkedIn or Indeed cycles when budget allows
+    if (useApify && (src === 'linkedin' || src === 'indeed' || src === 'all')) {
+      allRawJobs = allRawJobs.concat(apifyJobs);
+    }
+
+    // Source C: GulfTalent (local Playwright)
+    if (src === 'gulftalent' || src === 'all') {
+      try {
+        const gtJobs = await scrapeGulfTalentJobs(page, keyword, location, logFn);
+        allRawJobs = allRawJobs.concat(gtJobs);
+      } catch (err) {
+        logFn(`GulfTalent scraping failed: ${err.message}`, 'warning');
+      }
+    }
+
+    // Source D: Google Jobs (local Playwright)
+    if (src === 'google' || src === 'all') {
+      try {
+        const googleJobs = await scrapeGoogleJobs(page, keyword, location, logFn);
+        allRawJobs = allRawJobs.concat(googleJobs);
+      } catch (err) {
+        logFn(`Google Jobs scraping failed: ${err.message}`, 'warning');
+      }
+    }
+
+    logFn(`Aggregated ${allRawJobs.length} total potential job listings from all sources.`, 'info');
+
+    // 2. Filter, deduplicate, and blacklist check
     const newJobs = [];
-    for (const job of rawJobs) {
+    const seenUrlsInThisBatch = new Set();
+
+    for (const job of allRawJobs) {
+      if (!job.url || typeof job.url !== 'string' || job.url.trim() === '') {
+        continue;
+      }
       const urlLower = job.url.toLowerCase().trim();
       const compLower = job.company.toLowerCase().trim();
 
-      // Check duplicate
+      // Check unique in database
       if (existingUrls.has(urlLower)) {
         continue;
       }
+
+      // Check unique in current search run
+      if (seenUrlsInThisBatch.has(urlLower)) {
+        continue;
+      }
+      seenUrlsInThisBatch.add(urlLower);
 
       // Check blacklist
       const isBlacklisted = config.blacklistCompanies.some(bc => 
@@ -257,46 +573,62 @@ async function scrapeJobs(keyword, location, config, logFn) {
         continue;
       }
 
+      // Check gulf location
+      const gulfLocations = config.gulfLocations || [];
+      const jobLocationLower = (job.location || '').toLowerCase();
+      const isGulfJob = gulfLocations.length === 0 || gulfLocations.some(g => jobLocationLower.includes(g.toLowerCase()));
+      
+      if (!isGulfJob) {
+        logFn(`Skipping job outside Gulf: ${job.location} ("${job.title}")`, 'warning');
+        continue;
+      }
+
       newJobs.push(job);
     }
 
-    logFn(`Found ${newJobs.length} new, non-blacklisted jobs. Proceeding to scrape details for the top jobs...`, 'info');
+    logFn(`Found ${newJobs.length} new, unique, non-blacklisted jobs. Proceeding to scrape details for top jobs...`, 'info');
 
-    // Scrape details for up to 5 jobs (to prevent rate limits and keep it fast)
-    const limit = Math.min(newJobs.length, 5);
+    // 3. Scrape details for the top jobs (up to quota limit)
+    const limit = Math.min(newJobs.length, config.maxJobsScoredPerRun || 5);
     for (let i = 0; i < limit; i++) {
       const targetJob = newJobs[i];
-      logFn(`Scraping detail page for job ${i + 1}/${limit}: "${targetJob.title}" at ${targetJob.company}...`, 'info');
       
       try {
-        const details = await scrapeJobUrl(targetJob.url, logFn);
+        let details = null;
+        if (targetJob.description) {
+          logFn(`Job detail/description already retrieved for "${targetJob.title}" at ${targetJob.company}. Skipping detail page scrape.`, 'success');
+          details = targetJob;
+        } else {
+          logFn(`Scraping detail page for job ${i + 1}/${limit}: "${targetJob.title}" at ${targetJob.company}...`, 'info');
+          details = await scrapeJobUrl(targetJob.url, logFn, config);
+        }
+
         if (details && details.description) {
-          // Push job immediately — HR details are fetched in the background (non-blocking)
           const job = {
             title: details.title || targetJob.title,
             company: details.company || targetJob.company,
             url: targetJob.url,
+            location: details.location || targetJob.location,
             description: details.description,
-            poster: details.poster,
+            poster: details.poster || targetJob.poster || { name: '', title: '', url: '' },
             careerSiteUrl: '',
             hrEmail: ''
           };
           results.push(job);
-          logFn(`Successfully scraped "${details.title}" at ${details.company}`, 'success');
+          logFn(`Successfully retrieved details for "${details.title}" at ${details.company}`, 'success');
 
-          // Fire-and-forget: fetch HR details asynchronously without blocking the scraper
-          findHrDetails(job.company, logFn).then(hrDetails => {
+          // Asynchronously find HR contact info without blocking
+          findHrDetails(job.company, logFn, config, job.poster?.url).then(hrDetails => {
             job.careerSiteUrl = hrDetails.careerSiteUrl || '';
             job.hrEmail = hrDetails.hrEmail || '';
             if (hrDetails.careerSiteUrl || hrDetails.hrEmail) {
               logFn(`[HR] Found details for ${job.company}: ${hrDetails.hrEmail || ''} ${hrDetails.careerSiteUrl || ''}`, 'info');
             }
-          }).catch(() => { /* HR search failed silently */ });
+          }).catch(() => {});
         } else {
           logFn(`Failed to extract description for "${targetJob.title}"`, 'warning');
         }
         
-        // Wait between detail page requests to look human
         await delay(3000 + Math.random() * 2000);
       } catch (err) {
         logFn(`Failed to scrape job detail page: ${err.message}`, 'warning');

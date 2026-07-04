@@ -1,11 +1,23 @@
-node_modules/
-.env
+# Configuration & Credentials
 config.json
-database.json
+.env
+apify_budget.json
+answers.json
+
+# Local Databases
+database.sqlite
+database.sqlite-journal
+database.json.backup
+
+# Playwright user data session
 user_data/
 temp/
-scratch/
-tmp_hashes.txt
-file_hashes.txt
-hash_tmp.txt
+
+# Scraped Listings / Output Assets
+joblistings/
+
+# System files & dependencies
+node_modules/
+dist/
 .DS_Store
+*.log
